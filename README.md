@@ -1,5 +1,7 @@
 ### Pay me a drink
 
+Application for sending emails to people who owe you a drink. The application uses Azure Text Analytics to analyze the text of the email and determine if the person write a character in the drink list. If the person writes a character in the drink list, the application sends an email to the person with the list of people who owe him a drink.
+
 To set up the environment variables, create a `.env` file in the root directory of your project with the following content:
 
 ```
