@@ -1,0 +1,8 @@
+.env
+lib/
+scripts/
+Include/
+pyvenv.cfg
+*.json
+*.pdf
+*.csv

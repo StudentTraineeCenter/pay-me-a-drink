@@ -1,0 +1,7 @@
+customtkinter
+reportlab
+unidecode
+azure-cognitiveservices-vision-computervision
+msrest
+secure-smtplib
+python-dotenv
