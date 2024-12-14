@@ -23,3 +23,5 @@ Structure of input csv file:
 ```
 name;email
 ```
+
+Recognizable characters in the drink list: `K` , `P`.
