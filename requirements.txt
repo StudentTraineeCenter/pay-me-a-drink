@@ -5,3 +5,4 @@ azure-cognitiveservices-vision-computervision
 msrest
 secure-smtplib
 python-dotenv
+PyPDF2

@@ -12,9 +12,27 @@ import json
 from urllib.parse import urlencode
 import smtplib
 from dotenv import load_dotenv
+import pprint
+from PyPDF2 import PdfReader, PdfWriter
+from io import BytesIO
 
 max_persons_per_page = 18
 PREFERENCES_FILE = "preferences.json"
+program_files_folder_path = "program_files"
+
+PAYMENTS_JSON = {}
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
 
 def load_preferences():
     if os.path.exists(PREFERENCES_FILE):
@@ -259,7 +277,8 @@ class PayMeADrink:
             with open(file_path, newline='', encoding='utf-8') as csvfile:
                 reader = csv.reader(csvfile, delimiter=';')
                 self.persons = [{'name': row[0], 'email': row[1]} for row in reader]
-                print("Loaded data:", self.persons)
+                print(bcolors.HEADER + bcolors.BOLD + "Loaded data:" + bcolors.ENDC)
+                pprint.pprint(self.persons)
         else:
             self.file_button.configure(text="Prozkoumat")
             
@@ -279,21 +298,30 @@ class PayMeADrink:
         if not self.persons:
             print("No data available to generate PDF.")
             return
-
-        file_name = "pivni_seznam.pdf"
+        
+        # Make sure the directory exists
+        os.makedirs(program_files_folder_path, exist_ok=True)
+        
+        file_name = os.path.join(program_files_folder_path, "pivni_seznam.pdf")
         c = canvas.Canvas(file_name)
         
         page_number = 1
         y_position = 750  # Starting y position on the page
         
-        for index, person in enumerate(self.persons, start=1):
+        
+        duplicated_persons = []
+        for person in self.persons:
+            for i in range(2):
+                duplicated_persons.append(person)
+        
+        for index, person in enumerate(duplicated_persons, start=1):
             c.setFont("Helvetica-Bold", 20)
             max_number_of_underscores = 50
             c.drawString(20, y_position-3, "_" * max_number_of_underscores)
             c.drawString(20, y_position, f"@{unidecode(person['name'])}@")
             y_position -= 40  # Move down by 30 units for the next entry
 
-            if index % max_persons_per_page == 0 or index == len(self.persons):
+            if index % max_persons_per_page == 0 or index == len(duplicated_persons):
                 # Add footer with page number
                 c.drawString(265, 20, f"Strana {page_number}")
                 page_number += 1
@@ -301,10 +329,10 @@ class PayMeADrink:
                 y_position = 750  # Reset y position for the new page
 
         c.save()
-        print("PDF generated successfully as 'generated_report.pdf'.")
+        print(f"PDF generated successfully as '{file_name}'.")
         
-        #Open the generated PDF
-        os.startfile(file_name, "open")
+        # Open the generated PDF
+        os.startfile(file_name)
         
     def save_preferences(self):
         self.preferences["coke_price"] = int(self.coke_price_entry.get())
@@ -315,36 +343,50 @@ class PayMeADrink:
 
     def generate_csv_with_payments(self):
         if self.scanned_file_path != None:
-            # Replace with your key and endpoint
             api_key = AZURE_API_KEY
             endpoint = AZURE_ENDPOINT
-            # Open the image file and send it to the API
             client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(api_key))
-            with open(self.scanned_file_path, "rb") as image_stream:
-                # Send the image to the API
-                response = client.read_in_stream(image_stream, raw=True)
 
-            # Get the operation location (used to track the progress of the read operation)
-            operation_location = response.headers["Operation-Location"]
-            operation_id = operation_location.split("/")[-1]
-
-            # Poll for the results
-            while True:
-                result = client.get_read_result(operation_id)
-                if result.status not in ["notStarted", "running"]:
-                    break
-                print("Waiting for result...")
-                time.sleep(1)
-
-            # Process and print the results
             final_text = ""
-            
-            if result.status == "succeeded":
-                for page in result.analyze_result.read_results:
-                    for line in page.lines:
-                        final_text += line.text
-            else:
-                print("Analysis failed.")
+
+            # Read the original PDF
+            original_pdf = PdfReader(open(self.scanned_file_path, "rb"))
+
+            # Process each page individually
+            for page_num in range(len(original_pdf.pages)):
+                # Create a single-page PDF in memory
+                writer = PdfWriter()
+                writer.add_page(original_pdf.pages[page_num])
+                
+                byte_stream = BytesIO()
+                writer.write(byte_stream)
+                byte_stream.seek(0)  # Reset stream position to beginning
+                
+                # Send to Azure OCR
+                response = client.read_in_stream(byte_stream, raw=True)
+                
+                # Get operation ID
+                operation_location = response.headers["Operation-Location"]
+                operation_id = operation_location.split("/")[-1]
+
+                # Poll for results
+                while True:
+                    result = client.get_read_result(operation_id)
+                    if result.status not in ["notStarted", "running"]:
+                        break
+                    print(f"Waiting for page {page_num+1} result...")
+                    time.sleep(1)
+
+                # Extract text
+                if result.status == "succeeded":
+                    for page in result.analyze_result.read_results:
+                        for line in page.lines:
+                            final_text += line.text + "\n"
+                else:
+                    print(f"Analysis failed for page {page_num+1}")
+
+            #print("Final extracted text:")
+            #print(final_text)
                 
             final_text = final_text.replace(" ", "").replace("-", "").replace("_", "").replace("Strana", "")
             
@@ -355,75 +397,161 @@ class PayMeADrink:
             coke_price = self.preferences["coke_price"]
             beer_price = self.preferences["beer_price"]
             
+            # Initialize payment storage
+            payments_json = {}
+            
             total_coke_sold = 0
             total_beer_sold = 0
             total_earnings = 0
             total_unmatched = 0
             
-            
-            with open("payments.csv", "w", newline='', encoding="utf-8") as csvfile:
-                for i in range(0, len(final_text), 2):
-                    name = re.findall(r'[A-Z][a-z]*', final_text[i])
-                    name = " ".join(name)
-                    drinks = final_text[i+1]
+            # First parse all the data and aggregate by person
+            for i in range(0, len(final_text), 2):
+                if i+1 >= len(final_text):
+                    break
                     
-                    coke_amount =  0
-                    beer_amount = 0
-                    unmatched_amount = 0
-                    for char in drinks:
-                        if char == "K":
-                            coke_amount += 1
-                        elif char == "P":
-                            beer_amount += 1
-                        else:
-                            unmatched_amount += 1
-                            print(f"Unmatched character found in the scanned text. {char}")
-                    
-                    total_coke_sold += coke_amount
-                    total_beer_sold += beer_amount
-                    total_earnings += coke_amount * coke_price + beer_amount * beer_price
-                    total_unmatched += unmatched_amount
-                    
-                    total_price_per_person = coke_amount * coke_price + beer_amount * beer_price
-                    # Find the person in the persons list
-                    matched_person = None
-                    for person in self.persons:
-                        if unidecode(person['name']).lower() == name.lower():
-                            matched_person = person
-                            break
-
-                    if matched_person:
-                        print(f"Matched person: {matched_person['name']}")
-                        # Generate QR code for the payment
-                        
-                        if self.preferences["bank_account"] != " ":
-                            bank_account, bank_code =  self.preferences["bank_account"].split("/")
-                            
-                        
-                        
-                        qr_code_url = generate_czech_qr_code("https://api.paylibo.com/paylibo", account_number=bank_account, bank_code=bank_code, amount=(total_price_per_person), message=f"Platba za nápoje: Kofola: {coke_amount}x Pivo: {beer_amount}x", size=200)
-
-                        
-                        if(total_price_per_person > 0):
-                            csvfile.write(f"{matched_person['name']};{matched_person['email']};{coke_amount};{coke_amount*coke_price};{beer_amount};{beer_amount*beer_price};{total_price_per_person};{qr_code_url}\n")
-                    else:
-                        print(f"No match found for name: {name}")
-                    
-                    print(f"Name: {name}, Coke: {coke_amount}, Beer: {beer_amount}, Unmatched: {unmatched_amount}, Payment: {total_price_per_person}")
+                name = re.findall(r'[A-Z][a-z]*', final_text[i])
+                name = " ".join(name)
+                drinks = final_text[i+1]
                 
+                coke_amount = 0
+                beer_amount = 0
+                unmatched_amount = 0
+                for char in drinks:
+                    if char == "K":
+                        coke_amount += 1
+                    elif char == "P":
+                        beer_amount += 1
+                    else:
+                        if (char.strip() != ""):
+                            unmatched_amount += 1
+                            print(f"Unmatched character found in the scanned text. {bcolors.WARNING}{char}{bcolors.ENDC}")
+                
+                total_coke_sold += coke_amount
+                total_beer_sold += beer_amount
+                total_earnings += coke_amount * coke_price + beer_amount * beer_price
+                total_unmatched += unmatched_amount
+                
+                # Find the person in the persons list
+                matched_person = None
+                for person in self.persons:
+                    if unidecode(person['name']).lower() == name.lower():
+                        matched_person = person
+                        break
+                    
+                if matched_person:
+                    #print(f"Matched person: {matched_person['name']}")
+                    
+                    person_key = matched_person['name']
+                    # If person already exists in payments_json, add to their existing counts
+                    if person_key in payments_json:
+                        payments_json[person_key]['coke'] += coke_amount
+                        payments_json[person_key]['beer'] += beer_amount
+                        payments_json[person_key]['unmatched'] += unmatched_amount
+                    else:
+                        # Otherwise create a new entry
+                        payments_json[person_key] = {
+                            'email': matched_person['email'],
+                            'coke': coke_amount,
+                            'beer': beer_amount,
+                            'unmatched': unmatched_amount
+                        }
+                    
+                    #print(f"Name: {name}, Coke: {coke_amount}, Beer: {beer_amount}, Unmatched: {unmatched_amount}")
+                else:
+                    print(f"{bcolors.WARNING}{bcolors.BOLD}No match found for name: {name}{bcolors.ENDC}")
+            # a = f"""
+            #     {bcolors.HEADER}{bcolors.BOLD}Name: {name}{bcolors.ENDC}
+            #     {bcolors.OKGREEN}Matched person name: {matched_person['name'] if matched_person else bcolors.FAIL + "None"}{bcolors.ENDC}
+            #     {bcolors.OKGREEN}Matched person email: {matched_person['email'] if matched_person else bcolors.FAIL + "None"}{bcolors.ENDC}
+            #     {bcolors.OKCYAN}Coke Amount: {coke_amount}{bcolors.ENDC}
+            #     {bcolors.OKCYAN}Beer Amount: {beer_amount}{bcolors.ENDC}
+            #     {bcolors.WARNING}Unmatched Amount: {unmatched_amount}{bcolors.ENDC}
+            #     """
+            # print(a)
+            
+            b = f"""
+{bcolors.OKGREEN}Total Coke Sold: {total_coke_sold}{bcolors.ENDC}
+{bcolors.OKGREEN}Total Beer Sold: {total_beer_sold}{bcolors.ENDC}
+{bcolors.OKGREEN}Total Earnings: {total_earnings}{bcolors.ENDC}
+{bcolors.WARNING}Total Unmatched: {total_unmatched}{bcolors.ENDC}
+            """
+            print(b)
+            
+            # Ensure the directory exists
+            os.makedirs(program_files_folder_path, exist_ok=True)
+            
+            # Now generate the CSV from the aggregated data
+            csv_file_path = os.path.join(program_files_folder_path, "payments.csv")
+            with open(csv_file_path, "w", newline='', encoding="utf-8") as csvfile:
+                #pprint.pprint(payments_json)
+                for person_name, data in payments_json.items():
+                    coke_amount = data['coke']
+                    beer_amount = data['beer']
+                    unmatched_amount = data['unmatched']
+                    coke_cost = coke_amount * coke_price
+                    beer_cost = beer_amount * beer_price
+                    total_price = coke_cost + beer_cost
+                    
+                    a = f"""
+{bcolors.HEADER}{bcolors.BOLD}Name: {person_name}{bcolors.ENDC}
+    {bcolors.OKCYAN}Coke Amount: {coke_amount}{bcolors.ENDC}
+    {bcolors.OKCYAN}Beer Amount: {beer_amount}{bcolors.ENDC}
+    {bcolors.WARNING}Unmatched Amount: {unmatched_amount}{bcolors.ENDC}
+                        """
+                    print(a)
+                    
+                    if total_price > 0:
+                        # Generate QR code for the payment
+                        if self.preferences["bank_account"] != " ":
+                            try:
+                                # Split bank account info and clean any whitespace
+                                bank_account_parts = self.preferences["bank_account"].strip().split("/")
+                                bank_account = bank_account_parts[0].strip()
+                                bank_code = bank_account_parts[1].strip() if len(bank_account_parts) > 1 else ""
+                                
+                                # Make sure there are no non-numeric characters in the account number
+                                bank_account = ''.join(c for c in bank_account if c.isdigit())
+                                bank_code = ''.join(c for c in bank_code if c.isdigit())
+                                
+                                qr_code_url = generate_czech_qr_code(
+                                    "https://api.paylibo.com/paylibo", 
+                                    account_number=bank_account, 
+                                    bank_code=bank_code, 
+                                    amount=total_price, 
+                                    message=f"Platba za nápoje: Kofola: {coke_amount}x Pivo: {beer_amount}x", 
+                                    size=200
+                                )
+                            except Exception as e:
+                                print(f"Error generating QR code: {e}")
+                                qr_code_url = "Error generating QR code"
+                        else:
+                            qr_code_url = "No bank account configured"
+                        
+                        csvfile.write(f"{person_name};{data['email']};{coke_amount};{coke_cost};{beer_amount};{beer_cost};{total_price};{qr_code_url}\n")
+            
+            # Store the payments JSON for later use
+            global PAYMENTS_JSON
+            PAYMENTS_JSON = payments_json
+            
             self.total_coke_value.configure(text=str(total_coke_sold))
             self.total_beer_value.configure(text=str(total_beer_sold))
             self.total_earnings_value.configure(text=str(total_earnings))
             self.total_unmatched_value.configure(text=str(total_unmatched))
             
-            os.startfile("payments.csv", "open")
-                
             
+            print(f"Payments generated successfully as '{csv_file_path}'.")
+            # os.startfile(csv_file_path)
         else:
             print("No scanned file selected.")
             
     def send_email(self):
-        with open("payments.csv", newline='', encoding="utf-8") as csvfile:
+        csv_file_path = os.path.join(program_files_folder_path, "payments.csv")
+        if not os.path.exists(csv_file_path):
+            print(f"File {csv_file_path} does not exist.")
+            return
+            
+        with open(csv_file_path, newline='', encoding="utf-8") as csvfile:
             reader = csv.reader(csvfile, delimiter=';')
             
             print("Sending emails...")
