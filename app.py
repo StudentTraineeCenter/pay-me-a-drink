@@ -314,8 +314,18 @@ class PayMeADrink:
             for i in range(2):
                 duplicated_persons.append(person)
         
-        for index, person in enumerate(duplicated_persons, start=1):
-            c.setFont("Helvetica-Bold", 20)
+        black_color = (0, 0, 0)
+        grey_color = (0.4, 0.4, 0.4)
+        
+        
+        for index, person in enumerate(duplicated_persons, start=1):   
+            c.setFont("Helvetica-Bold", 20)            
+            # Determine color based on the index (change color every 2 names)
+            if (index - 1) // 2 % 2 == 0:  # Use integer division to change color every 2 people (4 entries in duplicated list)
+                c.setFillColorRGB(*black_color)
+            else:
+                c.setFillColorRGB(*grey_color)
+            
             max_number_of_underscores = 50
             c.drawString(20, y_position-3, "_" * max_number_of_underscores)
             c.drawString(20, y_position, f"@{unidecode(person['name'])}@")
@@ -323,6 +333,7 @@ class PayMeADrink:
 
             if index % max_persons_per_page == 0 or index == len(duplicated_persons):
                 # Add footer with page number
+                c.setFillColorRGB(*black_color)
                 c.drawString(265, 20, f"Strana {page_number}")
                 page_number += 1
                 c.showPage()  # Create a new page
