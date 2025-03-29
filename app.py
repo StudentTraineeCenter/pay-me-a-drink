@@ -469,14 +469,14 @@ class PayMeADrink:
                     "type": "AdaptiveCard",
                     "version": "1.2",
                     "body": [
-                        {"type": "TextBlock", "text": f"Summary for {person_name}", "size": "Medium", "weight": "Bolder"},
+                        {"type": "TextBlock", "text": f"Shrnutí pro {person_name}", "size": "Medium", "weight": "Bolder"},
                         {"type": "TextBlock", "text": f"Email: {data['email']}", "wrap": True},
                         {"type": "FactSet", "facts": [
-                            {"title": "Coke Amount:", "value": str(coke_amount)},
-                            {"title": "Coke Cost:", "value": f"{coke_cost} Kč"},
-                            {"title": "Beer Amount:", "value": str(beer_amount)},
-                            {"title": "Beer Cost:", "value": f"{beer_cost} Kč"},
-                            {"title": "Total Price:", "value": f"{total_price} Kč"}
+                            {"title": "Počet Kofol:", "value": str(coke_amount)},
+                            {"title": "Celková cena za Kofoly", "value": f"{coke_cost} Kč"},
+                            {"title": "Počet piv:", "value": str(beer_amount)},
+                            {"title": "Celková cena za piva:", "value": f"{beer_cost} Kč"},
+                            {"title": "Celková cena za vše:", "value": f"{total_price} Kč"}
                         ]},
                         {"type": "Image", "url": qr_code_url, "size": "Medium"}
                     ]
