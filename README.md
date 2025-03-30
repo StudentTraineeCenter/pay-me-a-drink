@@ -41,6 +41,5 @@ Recognizable characters in the drink list: `K` , `P`.
 9. Fill out the prices for the drinks and the bank account number in format `4567890/1234`.
 10. Click `Uložit ceny a účet`.
 11. Click 'Vybrat sken papíru' and select the `drink_list.pdf` file.
-12. Click `Vygenerovat CSV s platbami`.
+12. Click `Vygenerovat JSON s platbami`.
 13. In the terminal check the output if there where any unrecognized names or characters.
-14. If everything is ok, click `Poslat emaily s QR kódy.`.
