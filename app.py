@@ -377,7 +377,7 @@ class PayMeADrink:
                 beer_amount = 0
                 unmatched_amount = 0  # Reset for each person
                 for char in drinks:
-                    if char == "K":
+                    if char == "K" or char == "k":
                         coke_amount += 1
                     elif char == "P":
                         beer_amount += 1
