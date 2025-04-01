@@ -227,7 +227,10 @@ class PayMeADrink:
             
             with open(file_path, newline='', encoding='utf-8') as csvfile:
                 reader = csv.reader(csvfile, delimiter=';')
-                self.persons = [{'name': row[0], 'email': row[1]} for row in reader]
+                for row in reader:
+                    if len(row) >= 2:
+                        self.persons.append({'name': row[0], 'email': row[1]})
+
                 print(bcolors.HEADER + bcolors.BOLD + "Loaded data:" + bcolors.ENDC)
                 pprint.pprint(self.persons)
         else:
