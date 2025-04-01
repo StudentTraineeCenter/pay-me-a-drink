@@ -16,12 +16,19 @@ import pprint
 from PyPDF2 import PdfReader, PdfWriter
 from io import BytesIO
 from json import dump  # Add import for JSON dumping
+# Add new imports
+from pdf2image import convert_from_path
+from PIL import Image, ImageDraw
+from reportlab.lib.pagesizes import letter
+import fitz  # PyMuPDF
 
 max_persons_per_page = 18
 PREFERENCES_FILE = "preferences.json"
 program_files_folder_path = "program_files"
 
 PAYMENTS_JSON = {}
+
+DEBUG = True
 
 class bcolors:
     HEADER = '\033[95m'
@@ -44,6 +51,133 @@ def load_preferences():
 def save_preferences(preferences):
     with open(PREFERENCES_FILE, "w", encoding="utf-8") as file:
         json.dump(preferences, file)
+
+
+def is_decorative_line(text):
+    """
+    Check if a line of text is decorative (like underscores) rather than actual content.
+    
+    Args:
+        text: The text to check
+    
+    Returns:
+        bool: True if the text is decorative, False otherwise
+    """
+    # Check if the text consists only of underscores, dashes, or similar characters
+    if not text.strip():
+        return True  # Empty line
+    
+    decorative_chars = "_-="
+    return all(c in decorative_chars for c in text.strip())
+
+def contains_only_drink_characters(text):
+    """
+    Check if a text contains only characters used for drink tracking (K, k, P).
+    
+    Args:
+        text: The text to check
+    
+    Returns:
+        bool: True if the text contains only relevant drink characters, False otherwise
+    """
+    # Strip whitespace before checking
+    clean_text = text.strip()
+    if not clean_text:
+        return False
+        
+    # Check if all characters are in the allowed set
+    drink_chars = set(" KkP")
+    return all(c in drink_chars for c in clean_text)
+
+def draw_bounding_boxes_on_pdf(input_pdf_path, output_pdf_path, bounding_boxes, persons_list=None):
+    """
+    Draw bounding boxes on the PDF based on OCR results.
+    
+    Args:
+        input_pdf_path: Path to the original PDF
+        output_pdf_path: Path to save the annotated PDF
+        bounding_boxes: Dictionary with page number as key and list of (text, box_coords, width, height) tuples as value
+        persons_list: Optional list of person dictionaries to check for name matches
+    """
+    # Open the PDF with PyMuPDF (fitz)
+    doc = fitz.open(input_pdf_path)
+    
+    # Process each page
+    for page_num, boxes_data in bounding_boxes.items():
+        if page_num >= len(doc):
+            continue
+            
+        page = doc[page_num]
+        pdf_width = page.rect.width
+        pdf_height = page.rect.height
+        
+        # Draw each bounding box
+        for text, box, ocr_width, ocr_height in boxes_data:
+            # Skip drawing bounding boxes for decorative lines
+            if is_decorative_line(text):
+                continue
+                
+            # Scale coordinates from OCR coordinate system to PDF coordinate system
+            scaled_box = []
+            for i in range(0, len(box), 2):
+                # x coordinates are at even indices
+                scaled_box.append(box[i] / ocr_width * pdf_width)
+                # y coordinates are at odd indices
+                scaled_box.append(box[i+1] / ocr_height * pdf_height)
+            
+            # Extract scaled coordinates (x1, y1, x2, y2, x3, y3, x4, y4)
+            # The points should be: top-left, top-right, bottom-right, bottom-left
+            x1, y1 = scaled_box[0], scaled_box[1]  # Top-left
+            x2, y2 = scaled_box[2], scaled_box[3]  # Top-right
+            x3, y3 = scaled_box[4], scaled_box[5]  # Bottom-right
+            x4, y4 = scaled_box[6], scaled_box[7]  # Bottom-left
+            
+            # For a perfect rectangle with vertical sides, use:
+            # Find the min/max x and y values
+            min_x = min(x1, x4)
+            max_x = max(x2, x3)
+            min_y = min(y1, y2)
+            max_y = max(y3, y4)
+            
+            # Create rectangle with exact vertical and horizontal lines
+            rect = fitz.Rect(min_x, min_y, max_x, max_y)
+            
+            # Check if text is a match for a person name
+            is_name_match = False
+            if persons_list:
+                # Clean the text by removing @ symbols which are used in the PDF template
+                clean_text = text.strip().replace('@', '')
+                
+                # Check if this text matches any name in the persons list
+                for person in persons_list:
+                    if unidecode(person['name']).lower() == unidecode(clean_text).lower():
+                        is_name_match = True
+                        break
+            
+            # Choose color based on text content
+            if is_name_match:
+                # Use blue color for name matches (RGB: 0,0,1)
+                page.draw_rect(rect, color=(0, 0, 1), width=1.5)
+            elif "Strana" in text:
+                # Use grey color for page numbers (RGB: 0.5,0.5,0.5)
+                page.draw_rect(rect, color=(0.5, 0.5, 0.5), width=1)
+            
+            elif contains_only_drink_characters(text):
+                # Use green color for drink-tracking characters (RGB: 0,0.8,0)
+                page.draw_rect(rect, color=(0, 0.8, 0), width=1.5)
+            else:
+                # Use red color for other text (RGB: 1,0,0)
+                page.draw_rect(rect, color=(1, 0, 0), width=1)
+            
+            # Add text annotation above the box
+            page.insert_text(fitz.Point(min_x, min_y - 5), text, color=(0, 0, 1), fontsize=8)
+    
+    # Save the annotated PDF
+    doc.save(output_pdf_path)
+    doc.close()
+    
+    print(f"PDF with bounding boxes saved to {output_pdf_path}")
+    return output_pdf_path
 
 
 def load_credentials():
@@ -313,6 +447,8 @@ class PayMeADrink:
             client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(api_key))
 
             final_text = ""
+            # Dictionary to store bounding boxes for each page
+            all_bounding_boxes = {}
 
             # Read the original PDF
             original_pdf = PdfReader(open(self.scanned_file_path, "rb"))
@@ -328,7 +464,10 @@ class PayMeADrink:
                 byte_stream.seek(0)  # Reset stream position to beginning
 
                 # Send to Azure OCR
-                response = client.read_in_stream(byte_stream, raw=True)
+                try:
+                    response = client.read_in_stream(byte_stream, raw=True)
+                except Exception as e:
+                    print(f"Error during OCR processing: {e}")
 
                 # Get operation ID
                 operation_location = response.headers["Operation-Location"]
@@ -342,14 +481,44 @@ class PayMeADrink:
                     print(f"Waiting for page {page_num + 1} result...")
                     time.sleep(1)
 
-                # Extract text
+                # Extract text and bounding boxes
+                page_boxes = []
                 if result.status == "succeeded":
                     for page in result.analyze_result.read_results:
+                        ocr_width = page.width  # Get width from OCR result
+                        ocr_height = page.height  # Get height from OCR result
+                        
                         for line in page.lines:
                             final_text += line.text + "\n"
+                            # Store bounding box information with page dimensions
+                            bounding_box = line.bounding_box
+                            page_boxes.append((line.text, bounding_box, ocr_width, ocr_height))
+                            
+                            # Print bounding box info for debugging
+                            # print(f"OCR Text: {line.text}")
+                            # print(f"Bounding Box: {bounding_box}")
+                            # print(f"OCR Page Dimensions: {ocr_width} x {ocr_height}")
                 else:
                     print(f"Analysis failed for page {page_num + 1}")
+                
+                all_bounding_boxes[page_num] = page_boxes
 
+            if DEBUG:
+                # Create annotated PDF with bounding boxes
+                output_pdf_path = os.path.join(program_files_folder_path, "annotated_scan.pdf")
+                os.makedirs(program_files_folder_path, exist_ok=True)
+                # Pass the persons list to the function
+                annotated_pdf = draw_bounding_boxes_on_pdf(
+                    self.scanned_file_path, 
+                    output_pdf_path, 
+                    all_bounding_boxes,
+                    self.persons
+                )
+                
+                # Open the annotated PDF
+                os.startfile(annotated_pdf)
+
+            # Continue with existing processing
             final_text = final_text.replace(" ", "").replace("-", "").replace("_", "").replace("Strana", "")
             final_text = ''.join([i for i in final_text if not i.isdigit()])
             final_text = final_text.split("@")[1:]
