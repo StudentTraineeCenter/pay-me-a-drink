@@ -6,3 +6,6 @@ msrest
 secure-smtplib
 python-dotenv
 PyPDF2
+pdf2image
+Pillow
+PyMuPDF
