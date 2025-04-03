@@ -548,7 +548,7 @@ class PayMeADrink:
                 for char in drinks:
                     if char == "K" or char == "k":
                         coke_amount += 1
-                    elif char == "P":
+                    elif char == "P" or char == "p":
                         beer_amount += 1
                     else:
                         if char.strip() != "":
