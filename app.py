@@ -4,31 +4,33 @@ import csv
 from reportlab.pdfgen import canvas
 from unidecode import unidecode
 import os
+import subprocess
+import sys
 from azure.cognitiveservices.vision.computervision import ComputerVisionClient
 from msrest.authentication import CognitiveServicesCredentials
 import time
 import re
 import json
 from urllib.parse import urlencode
-import smtplib
 from dotenv import load_dotenv
 import pprint
 from PyPDF2 import PdfReader, PdfWriter
 from io import BytesIO
-from json import dump  # Add import for JSON dumping
-# Add new imports
+from json import dump
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 import fitz  # PyMuPDF
 
-max_persons_per_page = 18
-PREFERENCES_FILE = "preferences.json"
-program_files_folder_path = "program_files"
+load_dotenv()
 
-PAYMENTS_JSON = {}
-
-DEBUG = True
+PREFERENCES_FILE = os.getenv("PREFERENCES_FILE", "preferences.json")
+DRINKS_FILE = os.getenv("DRINKS_FILE", "drinks.json")
+INSTRUCTIONS_FILE = os.getenv("INSTRUCTIONS_FILE", "instructions.json")
+DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
 
 class bcolors:
     HEADER = '\033[95m'
@@ -42,11 +44,79 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 
+def load_drinks():
+    if os.path.exists(DRINKS_FILE):
+        with open(DRINKS_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    return []
+
+def save_drinks(drinks):
+    with open(DRINKS_FILE, "w", encoding="utf-8") as file:
+        json.dump(drinks, file, ensure_ascii=False, indent="\t")
+
+DEFAULTS = {
+    "bank_account": " ",
+    "lines_per_person": 2,
+    "max_persons_per_page": 18,
+    "copies": 1,
+    "program_files_folder": "program_files",
+    "qr_code_server_url": "https://api.paylibo.com/paylibo",
+    "event_name": "",
+    "organizer_name": "",
+    "message_template": "Ahoj, {event_name} je u konce a to znamená jediné. Přišel čas zúčtování.<br><br>Níže posílám tvůj přehled:<br><ul>{drinks_summary}</ul><b>Celkem: {total_price} Kč</b><br><br>Platbu můžeš poslat na účet <b>{bank_account}</b> nebo naskenovat QR kód:<br>{qr_code_url}<br><br>A pokud chceš ocenit moji snahu, dýšku se bránit nebudu. 😄<br><br>Díky a na další akci!<br><br><small><i>Analýza nápojů a rozesílání zpráv proběhly automaticky. V případě dotazů nebo reklamací kontaktuj {organizer_name}.</i></small>"
+}
+
+# Texts of the instruction page. Placeholders: {lines_per_person}, {lines_word}, {event_name}, {organizer_name}, {price}
+DEFAULT_INSTRUCTIONS = {
+    "title": "Pití na teambuildingu",
+    "subtitle": "{event_name}",
+    "rules": [
+        "Pití najdeš na třech místech: v lednici v suterénu hlavní budovy, v jídelně a ve společenské místnosti.",
+        "Vezmi si, na co máš chuť, a do svého řádku připiš znak z tabulky dole. Co kus, to jeden znak – třeba dvě piva a kofola = PPK.",
+        "U pití jsou volně k dispozici půllitrové kelímky – ber si, kolik potřebuješ.",
+        "Piš VELKÝMI TISKACÍMI PÍSMENY. Papíry po akci čte počítač (OCR) a na krasopis moc není.",
+        "Každý má {lines_per_person} {lines_word}. Když ti dojde místo nebo na seznamu chybíš, připiš se dolů jako @Prijmeni Jmeno@ – bez háčků a čárek a i se zavináči.",
+        "Když se spleteš, špatný znak celý začerni, ať z něj zbyde jen černý čtvereček – jako u přijímaček. Jen přeškrtnutý by ho počítač pořád přečetl.",
+        "Po akci ti přijde přehled útraty a QR kód na zaplacení."
+    ],
+    "lines_word_forms": [
+        "řádek",
+        "řádky",
+        "řádků"
+    ],
+    "menu_title": "Co si můžeš dát",
+    "column_name": "Pití",
+    "column_price": "Cena",
+    "column_characters": "Znak",
+    "price_format": "{price} Kč",
+    "footer": "O pití se stará {organizer_name}"
+}
+
+def load_instructions():
+    """Load instruction texts; create the file with defaults when it does not exist yet."""
+    instructions = dict(DEFAULT_INSTRUCTIONS)
+    if os.path.exists(INSTRUCTIONS_FILE):
+        with open(INSTRUCTIONS_FILE, "r", encoding="utf-8") as file:
+            instructions.update(json.load(file))
+    else:
+        with open(INSTRUCTIONS_FILE, "w", encoding="utf-8") as file:
+            json.dump(DEFAULT_INSTRUCTIONS, file, ensure_ascii=False, indent="\t")
+    return instructions
+
+class _KeepMissing(dict):
+    """format_map helper that leaves unknown {placeholders} untouched instead of failing."""
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+def fill_placeholders(template, **values):
+    return template.format_map(_KeepMissing(values))
+
 def load_preferences():
+    prefs = dict(DEFAULTS)
     if os.path.exists(PREFERENCES_FILE):
         with open(PREFERENCES_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    return {"coke_price": 20, "beer_price": 30, "bank_account": " "}
+            prefs.update(json.load(file))
+    return prefs
 
 def save_preferences(preferences):
     with open(PREFERENCES_FILE, "w", encoding="utf-8") as file:
@@ -70,23 +140,190 @@ def is_decorative_line(text):
     decorative_chars = "_-="
     return all(c in decorative_chars for c in text.strip())
 
-def contains_only_drink_characters(text):
-    """
-    Check if a text contains only characters used for drink tracking (K, k, P).
-    
-    Args:
-        text: The text to check
-    
-    Returns:
-        bool: True if the text contains only relevant drink characters, False otherwise
-    """
-    # Strip whitespace before checking
+# Czech alphabet order; č, ř, š, ž and "ch" are separate letters
+CZECH_ALPHABET = ["a", "b", "c", "č", "d", "e", "f", "g", "h", "ch", "i", "j", "k", "l", "m",
+                  "n", "o", "p", "q", "r", "ř", "s", "š", "t", "u", "v", "w", "x", "y", "z", "ž"]
+CZECH_RANK = {letter: rank for rank, letter in enumerate(CZECH_ALPHABET)}
+# Letters whose accent only matters as a tie-breaker (sorted like their base letter)
+CZECH_SECONDARY = {"á": "a", "ď": "d", "é": "e", "ě": "e", "í": "i", "ň": "n",
+                   "ó": "o", "ť": "t", "ú": "u", "ů": "u", "ý": "y"}
+
+def czech_sort_key(text):
+    """Return a sort key following Czech alphabetical order (z < ž, h < ch < i)."""
+    text = text.casefold()
+    primary = []
+    secondary = []
+    i = 0
+    while i < len(text):
+        if text[i:i + 2] == "ch":
+            primary.append(CZECH_RANK["ch"])
+            secondary.append(0)
+            i += 2
+            continue
+        char = text[i]
+        if char.isspace():
+            # Word boundary sorts before any letter ("Novák Jan" < "Nováková Eva")
+            primary.append(-1)
+            secondary.append(0)
+        elif char in CZECH_RANK:
+            primary.append(CZECH_RANK[char])
+            secondary.append(0)
+        elif char in CZECH_SECONDARY:
+            primary.append(CZECH_RANK[CZECH_SECONDARY[char]])
+            secondary.append(1)
+        else:
+            # Foreign accented letters fall back to their ASCII base, other chars go last
+            base = unidecode(char).casefold()[:1]
+            primary.append(CZECH_RANK.get(base, len(CZECH_ALPHABET) + ord(char)))
+            secondary.append(0 if base == char else 1)
+        i += 1
+    return (primary, secondary, text)
+
+# TTF fonts with Czech glyphs (built-in Helvetica cannot render č, ř, ž, ...)
+FONT_CANDIDATES = [
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
+]
+
+def register_unicode_fonts():
+    """Register a regular/bold TTF pair with Czech glyphs. Returns (regular, bold, supports_unicode)."""
+    for regular_path, bold_path in FONT_CANDIDATES:
+        if os.path.exists(regular_path) and os.path.exists(bold_path):
+            if "Unicode" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("Unicode", regular_path))
+                pdfmetrics.registerFont(TTFont("Unicode-Bold", bold_path))
+            return "Unicode", "Unicode-Bold", True
+    print(f"{bcolors.WARNING}No TTF font with Czech glyphs found, instructions will be without diacritics.{bcolors.ENDC}")
+    return "Helvetica", "Helvetica-Bold", False
+
+def czech_plural(count, one, few, many):
+    """Pick the Czech plural form: 1 řádek, 2-4 řádky, 5+ řádků."""
+    if count == 1:
+        return one
+    if 2 <= count <= 4:
+        return few
+    return many
+
+def wrap_czech_text(text, font_name, font_size, max_width):
+    """Wrap text to max_width; single-letter words (v, k, s, z, a, ...) never end a line."""
+    # Glue each single-letter word to the word that follows it
+    groups = []
+    pending = ""
+    for word in text.split():
+        if len(word) == 1 and word.isalpha():
+            pending += word + " "
+        else:
+            groups.append(pending + word)
+            pending = ""
+    if pending:
+        groups.append(pending.strip())
+
+    lines = []
+    current = ""
+    for group in groups:
+        candidate = f"{current} {group}" if current else group
+        if current and pdfmetrics.stringWidth(candidate, font_name, font_size) > max_width:
+            lines.append(current)
+            current = group
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+def draw_instruction_page(c, drinks, instructions, lines_per_person, event_name="", organizer_name=""):
+    """Draw one A4 page with instructions for participants and the drink menu."""
+    regular, bold, unicode_ok = register_unicode_fonts()
+    text = (lambda t: t) if unicode_ok else unidecode
+    page_width, page_height = A4
+    margin = 50
+    content_width = page_width - 2 * margin
+    c.setFillColorRGB(0, 0, 0)
+
+    # Title
+    y = page_height - 80
+    c.setFont(bold, 30)
+    lines_word = czech_plural(lines_per_person, *instructions["lines_word_forms"])
+    fill = lambda template: text(fill_placeholders(template, lines_per_person=lines_per_person,
+                                                   lines_word=lines_word, event_name=event_name,
+                                                   organizer_name=organizer_name))
+    c.drawCentredString(page_width / 2, y, fill(instructions["title"]))
+    subtitle = fill(instructions["subtitle"]).strip()
+    if subtitle:
+        y -= 26
+        c.setFont(regular, 15)
+        c.drawCentredString(page_width / 2, y, subtitle)
+
+    # Rules
+    rules = [fill(rule) for rule in instructions["rules"]]
+    font_size = 14
+    line_height = 20
+    bullet_indent = 16
+    y -= 45
+    c.setFont(regular, font_size)
+    for rule in rules:
+        wrapped = wrap_czech_text(rule, regular, font_size, content_width - bullet_indent)
+        c.drawString(margin, y, "•")
+        for line in wrapped:
+            c.drawString(margin + bullet_indent, y, line)
+            y -= line_height
+        y -= 6
+
+    # Drink menu
+    y -= 25
+    c.setFont(bold, 24)
+    c.drawString(margin, y, fill(instructions["menu_title"]))
+    y -= 35
+
+    col_name = margin
+    col_price = margin + content_width * 0.62
+    col_char = margin + content_width * 0.80
+    row_height = 26
+
+    c.setFont(bold, font_size)
+    c.drawString(col_name, y, fill(instructions["column_name"]))
+    c.drawString(col_price, y, fill(instructions["column_price"]))
+    c.drawString(col_char, y, fill(instructions["column_characters"]))
+    y -= 8
+    c.setLineWidth(1)
+    c.line(margin, y, page_width - margin, y)
+
+    for drink in drinks:
+        y -= row_height - 8
+        c.setFont(regular, font_size)
+        c.drawString(col_name, y, text(drink["name"]))
+        c.drawString(col_price, y, text(fill_placeholders(instructions["price_format"], price=drink["price"])))
+        c.setFont(bold, font_size + 4)
+        c.drawString(col_char, y, ", ".join(drink.get("characters", [])))
+        y -= 8
+        c.setLineWidth(0.3)
+        c.line(margin, y, page_width - margin, y)
+
+    # Small footer in the bottom right corner (e.g. who takes care of the drinks)
+    footer = fill(instructions.get("footer", "")).strip()
+    if footer:
+        c.setFont(regular, 10)
+        c.setFillColorRGB(0.35, 0.35, 0.35)
+        c.drawRightString(page_width - margin, 40, footer)
+        c.setFillColorRGB(0, 0, 0)
+
+
+def get_all_drink_characters(drinks):
+    chars = set(" ")
+    for drink in drinks:
+        for c in drink.get("characters", []):
+            chars.add(c)
+    return chars
+
+def contains_only_drink_characters(text, drinks=None):
     clean_text = text.strip()
     if not clean_text:
         return False
-        
-    # Check if all characters are in the allowed set
-    drink_chars = set(" KkP")
+    if drinks is None:
+        drinks = load_drinks()
+    drink_chars = get_all_drink_characters(drinks)
     return all(c in drink_chars for c in clean_text)
 
 def draw_bounding_boxes_on_pdf(input_pdf_path, output_pdf_path, bounding_boxes, persons_list=None):
@@ -180,15 +417,10 @@ def draw_bounding_boxes_on_pdf(input_pdf_path, output_pdf_path, bounding_boxes, 
     return output_pdf_path
 
 
-def load_credentials():
-    load_dotenv()
+AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT')
+AZURE_API_KEY = os.getenv('AZURE_API_KEY')
 
-    global AZURE_ENDPOINT, AZURE_API_KEY
-    
-    AZURE_ENDPOINT = os.getenv('AZURE_ENDPOINT')
-    AZURE_API_KEY = os.getenv('AZURE_API_KEY')
-
-def generate_czech_qr_code(server_url, account_prefix=None, account_number=None, bank_code=None, 
+def generate_czech_qr_code(server_url, account_prefix=None, account_number=None, bank_code=None,
                             amount=None, currency=None, vs=None, ks=None, ss=None, identifier=None, 
                             date=None, message=None, compress=True, branding=True, size=None):
     """
@@ -243,7 +475,6 @@ def generate_czech_qr_code(server_url, account_prefix=None, account_number=None,
 
 class PayMeADrink:
     def __init__(self):
-        load_credentials()  # Load credentials at the start
         self.app = ctk.CTk()
         self.app.title("Generování pivního záznamu")
         
@@ -274,6 +505,11 @@ class PayMeADrink:
 
         self.generate_button = ctk.CTkButton(self.left_frame, text="Vygenerovat PDF", command=self.generate_pdf)
         self.generate_button.pack(side="left", padx=10)
+
+        self.copies_label = ctk.CTkLabel(self.left_frame, text="Kopií:")
+        self.copies_label.pack(side="left", padx=(10, 5))
+        self.copies_entry = ctk.CTkEntry(self.left_frame, width=50)
+        self.copies_entry.pack(side="left", padx=(0, 10))
         
         self.label_second = ctk.CTkLabel(self.right_frame, text="Poslání QR plateb.", font=("Helvetica", 16, "bold"))
         self.label_second.pack(pady=10)
@@ -286,63 +522,80 @@ class PayMeADrink:
         
         self.settings_label = ctk.CTkLabel(self.settings_frame, text="Nastavení cen a účtu", font=("Helvetica", 16, "bold"))
         self.settings_label.pack(pady=10)
-        
+
         self.preferences = load_preferences()
+        self.drinks = load_drinks()
+        self.copies_entry.insert(0, str(self.preferences.get("copies", 1)))
 
-        self.coke_price_frame = ctk.CTkFrame(self.settings_frame)
-        self.coke_price_frame.pack(pady=5, fill="x")
-        self.coke_price_label = ctk.CTkLabel(self.coke_price_frame, text="Cena za Kofolu:              ")
-        self.coke_price_label.pack(side="left", padx=5)
-        self.coke_price_entry = ctk.CTkEntry(self.coke_price_frame)
-        self.coke_price_entry.insert(0, str(self.preferences["coke_price"]))
-        self.coke_price_entry.pack(side="left", padx=5)
+        # Build a character-to-drink lookup for OCR matching
+        self.char_to_drink = {}
+        for drink in self.drinks:
+            for c in drink.get("characters", []):
+                self.char_to_drink[c] = drink["id"]
 
-        self.beer_price_frame = ctk.CTkFrame(self.settings_frame)
-        self.beer_price_frame.pack(pady=5, fill="x")
-        self.beer_price_label = ctk.CTkLabel(self.beer_price_frame, text="Cena za Pivo:                  ")
-        self.beer_price_label.pack(side="left", padx=5)
-        self.beer_price_entry = ctk.CTkEntry(self.beer_price_frame)
-        self.beer_price_entry.insert(0, str(self.preferences["beer_price"]))
-        self.beer_price_entry.pack(side="left", padx=5)
+        # Dynamic drink price entries
+        self.drink_price_entries = {}
+        for drink in self.drinks:
+            frame = ctk.CTkFrame(self.settings_frame)
+            frame.pack(pady=5, fill="x")
+            label = ctk.CTkLabel(frame, text=f"Cena za {drink['name']}:")
+            label.pack(side="left", padx=5)
+            entry = ctk.CTkEntry(frame)
+            entry.insert(0, str(drink["price"]))
+            entry.pack(side="left", padx=5)
+            self.drink_price_entries[drink["id"]] = entry
+
+        self.event_name_frame = ctk.CTkFrame(self.settings_frame)
+        self.event_name_frame.pack(pady=5, fill="x")
+        self.event_name_label = ctk.CTkLabel(self.event_name_frame, text="Název akce:")
+        self.event_name_label.pack(side="left", padx=5)
+        self.event_name_entry = ctk.CTkEntry(self.event_name_frame)
+        self.event_name_entry.insert(0, self.preferences.get("event_name", ""))
+        self.event_name_entry.pack(side="left", padx=5)
+
+        self.organizer_name_frame = ctk.CTkFrame(self.settings_frame)
+        self.organizer_name_frame.pack(pady=5, fill="x")
+        self.organizer_name_label = ctk.CTkLabel(self.organizer_name_frame, text="Jméno organizátora:")
+        self.organizer_name_label.pack(side="left", padx=5)
+        self.organizer_name_entry = ctk.CTkEntry(self.organizer_name_frame)
+        self.organizer_name_entry.insert(0, self.preferences.get("organizer_name", ""))
+        self.organizer_name_entry.pack(side="left", padx=5)
 
         self.bank_account_frame = ctk.CTkFrame(self.settings_frame)
         self.bank_account_frame.pack(pady=5, fill="x")
         self.bank_account_label = ctk.CTkLabel(self.bank_account_frame, text="Číslo bankovního účtu:")
         self.bank_account_label.pack(side="left", padx=5)
         self.bank_account_entry = ctk.CTkEntry(self.bank_account_frame)
-        self.bank_account_entry.insert(0, self.preferences["bank_account"])
+        self.bank_account_entry.insert(0, self.preferences.get("bank_account", " "))
         self.bank_account_entry.pack(side="left", padx=5)
 
-        self.save_button = ctk.CTkButton(self.settings_frame, text="Uložit ceny a účet", command=self.save_preferences)
+        self.save_button = ctk.CTkButton(self.settings_frame, text="Uložit nastavení", command=self.save_preferences)
         self.save_button.pack(pady=10)
 
         self.earnings_label = ctk.CTkLabel(self.earnings_frame, text="Tržby", font=("Helvetica", 16, "bold"))
         self.earnings_label.pack(pady=10)
 
-        self.total_coke_frame = ctk.CTkFrame(self.earnings_frame)
-        self.total_coke_frame.pack(pady=5, fill="x")
-        self.total_coke_label = ctk.CTkLabel(self.total_coke_frame, text="Celkem Kofol prodáno:   ")
-        self.total_coke_label.pack(side="left", padx=5)
-        self.total_coke_value = ctk.CTkLabel(self.total_coke_frame, text="0")
-        self.total_coke_value.pack(side="left", padx=5)
-    
-        self.total_beer_frame = ctk.CTkFrame(self.earnings_frame)
-        self.total_beer_frame.pack(pady=5, fill="x")
-        self.total_beer_label = ctk.CTkLabel(self.total_beer_frame, text="Celkem Piv prodáno: ")
-        self.total_beer_label.pack(side="left", padx=5)
-        self.total_beer_value = ctk.CTkLabel(self.total_beer_frame, text="0")
-        self.total_beer_value.pack(side="left", padx=5)
+        # Dynamic drink sold labels
+        self.drink_sold_values = {}
+        for drink in self.drinks:
+            frame = ctk.CTkFrame(self.earnings_frame)
+            frame.pack(pady=5, fill="x")
+            label = ctk.CTkLabel(frame, text=f"Celkem {drink['name']} prodáno:")
+            label.pack(side="left", padx=5)
+            value = ctk.CTkLabel(frame, text="0")
+            value.pack(side="left", padx=5)
+            self.drink_sold_values[drink["id"]] = value
 
         self.total_earnings_frame = ctk.CTkFrame(self.earnings_frame)
         self.total_earnings_frame.pack(pady=5, fill="x")
-        self.total_earnings_label = ctk.CTkLabel(self.total_earnings_frame, text="Celkový výdělek:      ")
+        self.total_earnings_label = ctk.CTkLabel(self.total_earnings_frame, text="Celkový výdělek:")
         self.total_earnings_label.pack(side="left", padx=5)
         self.total_earnings_value = ctk.CTkLabel(self.total_earnings_frame, text="0")
         self.total_earnings_value.pack(side="left", padx=5)
 
         self.total_unmatched_frame = ctk.CTkFrame(self.earnings_frame)
         self.total_unmatched_frame.pack(pady=5, fill="x")
-        self.total_unmatched_label = ctk.CTkLabel(self.total_unmatched_frame, text="Neuznané znaky: ")
+        self.total_unmatched_label = ctk.CTkLabel(self.total_unmatched_frame, text="Neuznané znaky:")
         self.total_unmatched_label.pack(side="left", padx=5)
         self.total_unmatched_value = ctk.CTkLabel(self.total_unmatched_frame, text="0")
         self.total_unmatched_value.pack(side="left", padx=5)
@@ -358,12 +611,20 @@ class PayMeADrink:
         if file_path:
             filename = os.path.basename(file_path)
             self.file_button.configure(text=filename)
-            
+
             with open(file_path, newline='', encoding='utf-8') as csvfile:
                 reader = csv.reader(csvfile, delimiter=';')
                 for row in reader:
-                    if len(row) >= 2:
-                        self.persons.append({'name': row[0], 'email': row[1]})
+                    if len(row) >= 1 and row[0].strip():
+                        # CSV holds "Surname First [Middle]"; keep it as the key and
+                        # build the natural "First [Middle] Surname" form for messages/emails
+                        parts = row[0].split()
+                        name = " ".join(parts)
+                        full_name = " ".join(parts[1:] + parts[:1])
+                        self.persons.append({'name': name, 'full_name': full_name})
+
+                # Sort by surname, then first/middle names (Czech alphabetical order)
+                self.persons.sort(key=lambda p: czech_sort_key(p['name']))
 
                 print(bcolors.HEADER + bcolors.BOLD + "Loaded data:" + bcolors.ENDC)
                 pprint.pprint(self.persons)
@@ -383,43 +644,75 @@ class PayMeADrink:
             self.file_button_scan.configure(text="Prozkoumat")
 
     def generate_pdf(self):
-        if not self.persons:
-            print("No data available to generate PDF.")
+        try:
+            copies = int(self.copies_entry.get().strip() or 1)
+            if copies < 1:
+                raise ValueError
+        except ValueError:
+            print(f"{bcolors.FAIL}Number of copies must be a whole number of at least 1.{bcolors.ENDC}")
             return
-        
+        self.preferences["copies"] = copies
+        save_preferences(self.preferences)
+
+        if not self.persons:
+            print(f"{bcolors.WARNING}No persons loaded, generating instruction pages only.{bcolors.ENDC}")
+
         # Make sure the directory exists
-        os.makedirs(program_files_folder_path, exist_ok=True)
+        os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
+
+        file_name = os.path.join(self.preferences["program_files_folder"], "pivni_seznam.pdf")
+        c = canvas.Canvas(file_name, pagesize=A4)
+
+        # Reloaded on every generation, so edits to the JSON apply without restarting the app
+        instructions = load_instructions()
+
+        # Each copy = one instruction page followed by the whole list (page numbers restart per copy).
+        # No copy label is printed on list pages: OCR reads the footer and its letters could match drinks.
+        for _ in range(copies):
+            draw_instruction_page(c, self.drinks, instructions, self.preferences["lines_per_person"],
+                                  self.preferences.get("event_name", ""),
+                                  self.preferences.get("organizer_name", ""))
+            c.showPage()
+            self.draw_person_list(c)
+
+        c.save()
+        print(f"PDF generated successfully as '{file_name}'.")
         
-        file_name = os.path.join(program_files_folder_path, "pivni_seznam.pdf")
-        c = canvas.Canvas(file_name)
+        # Open the generated PDF
+        if sys.platform == "win32":
+            os.startfile(file_name)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", file_name])
+        else:
+            subprocess.Popen(["xdg-open", file_name])
         
-        page_number = 1
-        y_position = 750  # Starting y position on the page
-        
-        
+    def draw_person_list(self, c):
+        """Draw the list of persons with lines for drink characters, one or more pages."""
+        lines_per_person = self.preferences["lines_per_person"]
         duplicated_persons = []
         for person in self.persons:
-            for i in range(2):
+            for i in range(lines_per_person):
                 duplicated_persons.append(person)
-        
+
         black_color = (0, 0, 0)
         grey_color = (0.4, 0.4, 0.4)
-        
-        
-        for index, person in enumerate(duplicated_persons, start=1):   
-            c.setFont("Helvetica-Bold", 20)            
-            # Determine color based on the index (change color every 2 names)
-            if (index - 1) // 2 % 2 == 0:  # Use integer division to change color every 2 people (4 entries in duplicated list)
+        page_number = 1
+        y_position = 750  # Starting y position on the page
+
+        for index, person in enumerate(duplicated_persons, start=1):
+            c.setFont("Helvetica-Bold", 20)
+            # Alternate color for each person (every lines_per_person rows)
+            if (index - 1) // lines_per_person % 2 == 0:
                 c.setFillColorRGB(*black_color)
             else:
                 c.setFillColorRGB(*grey_color)
-            
+
             max_number_of_underscores = 50
             c.drawString(20, y_position-3, "_" * max_number_of_underscores)
             c.drawString(20, y_position, f"@{unidecode(person['name'])}@")
-            y_position -= 40  # Move down by 30 units for the next entry
+            y_position -= 40  # Move down for the next entry
 
-            if index % max_persons_per_page == 0 or index == len(duplicated_persons):
+            if index % self.preferences["max_persons_per_page"] == 0 or index == len(duplicated_persons):
                 # Add footer with page number
                 c.setFillColorRGB(*black_color)
                 c.drawString(265, 20, f"Strana {page_number}")
@@ -427,18 +720,20 @@ class PayMeADrink:
                 c.showPage()  # Create a new page
                 y_position = 750  # Reset y position for the new page
 
-        c.save()
-        print(f"PDF generated successfully as '{file_name}'.")
-        
-        # Open the generated PDF
-        os.startfile(file_name)
-        
     def save_preferences(self):
-        self.preferences["coke_price"] = int(self.coke_price_entry.get())
-        self.preferences["beer_price"] = int(self.beer_price_entry.get())
+        # Save drink prices to drinks.json
+        for drink in self.drinks:
+            entry = self.drink_price_entries.get(drink["id"])
+            if entry:
+                drink["price"] = int(entry.get())
+        save_drinks(self.drinks)
+
+        # Save preferences to preferences.json
+        self.preferences["event_name"] = self.event_name_entry.get()
+        self.preferences["organizer_name"] = self.organizer_name_entry.get()
         self.preferences["bank_account"] = self.bank_account_entry.get()
         save_preferences(self.preferences)
-        print("Preferences saved:", self.preferences)
+        print("Preferences saved. Drinks:", self.drinks, "Preferences:", self.preferences)
      
     def generate_json_with_payments(self):
         if self.scanned_file_path:
@@ -503,33 +798,48 @@ class PayMeADrink:
                 
                 all_bounding_boxes[page_num] = page_boxes
 
-            if DEBUG:
-                # Create annotated PDF with bounding boxes
-                output_pdf_path = os.path.join(program_files_folder_path, "annotated_scan.pdf")
-                os.makedirs(program_files_folder_path, exist_ok=True)
-                # Pass the persons list to the function
-                annotated_pdf = draw_bounding_boxes_on_pdf(
-                    self.scanned_file_path, 
-                    output_pdf_path, 
-                    all_bounding_boxes,
-                    self.persons
-                )
-                
-                # Open the annotated PDF
+            # Create annotated PDF with bounding boxes
+            output_pdf_path = os.path.join(self.preferences["program_files_folder"], "annotated_scan.pdf")
+            os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
+            annotated_pdf = draw_bounding_boxes_on_pdf(
+                self.scanned_file_path,
+                output_pdf_path,
+                all_bounding_boxes,
+                self.persons
+            )
+
+            if sys.platform == "win32":
                 os.startfile(annotated_pdf)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", annotated_pdf])
+            else:
+                subprocess.Popen(["xdg-open", annotated_pdf])
 
             # Continue with existing processing
+            if DEBUG:
+                print(f"\n{bcolors.HEADER}=== RAW OCR TEXT ==={bcolors.ENDC}")
+                print(repr(final_text[:500]))
+
             final_text = final_text.replace(" ", "").replace("-", "").replace("_", "").replace("Strana", "")
             final_text = ''.join([i for i in final_text if not i.isdigit()])
             final_text = final_text.split("@")[1:]
 
-            coke_price = self.preferences["coke_price"]
-            beer_price = self.preferences["beer_price"]
+            if DEBUG:
+                print(f"\n{bcolors.HEADER}=== PARSED SEGMENTS (split by @) ==={bcolors.ENDC}")
+                for idx, segment in enumerate(final_text):
+                    label = "NAME" if idx % 2 == 0 else "DRINKS"
+                    print(f"  [{idx}] {label}: {repr(segment.strip())}")
+                if self.persons:
+                    print(f"\n{bcolors.HEADER}=== LOADED PERSONS ({len(self.persons)}) ==={bcolors.ENDC}")
+                    for p in self.persons:
+                        print(f"  - {p['name']} → unidecode: {unidecode(p['name'])}")
+
+            # Build price lookup from drinks config
+            drink_prices = {drink["id"]: drink["price"] for drink in self.drinks}
 
             # Initialize payment storage
             payments_json = {}
-            total_coke_sold = 0
-            total_beer_sold = 0
+            total_sold = {drink["id"]: 0 for drink in self.drinks}
             total_earnings = 0
             total_unmatched = 0
 
@@ -540,101 +850,101 @@ class PayMeADrink:
 
                 name = re.findall(r'[A-Z][a-z]*', final_text[i])
                 name = " ".join(name)
-                drinks = final_text[i + 1]
+                drink_text = final_text[i + 1]
 
-                coke_amount = 0
-                beer_amount = 0
-                unmatched_amount = 0  # Reset for each person
-                for char in drinks:
-                    if char == "K" or char == "k":
-                        coke_amount += 1
-                    elif char == "P" or char == "p":
-                        beer_amount += 1
-                    else:
-                        if char.strip() != "":
-                            unmatched_amount += 1  # Increment unmatched amount
-                            print(f"Unmatched character found in the scanned text. {bcolors.WARNING}{char}{bcolors.ENDC}")
+                if DEBUG:
+                    print(f"\n{bcolors.OKCYAN}Processing: name='{name}', drinks='{drink_text.strip()}'{bcolors.ENDC}")
 
-                total_coke_sold += coke_amount
-                total_beer_sold += beer_amount
-                total_earnings += coke_amount * coke_price + beer_amount * beer_price
-                total_unmatched += unmatched_amount  # Accumulate unmatched amount globally
+                amounts = {drink["id"]: 0 for drink in self.drinks}
+                unmatched_amount = 0
+                unmatched_chars = []
+                for char in drink_text:
+                    drink_id = self.char_to_drink.get(char)
+                    if drink_id:
+                        amounts[drink_id] += 1
+                    elif char.strip() != "":
+                        unmatched_amount += 1
+                        unmatched_chars.append(char)
+                        print(f"Unmatched character found in the scanned text. {bcolors.WARNING}{char}{bcolors.ENDC}")
 
-                # Find the person in the persons list
-                matched_person = None
+                person_earnings = 0
+                for drink_id, count in amounts.items():
+                    total_sold[drink_id] += count
+                    person_earnings += count * drink_prices[drink_id]
+                total_earnings += person_earnings
+                total_unmatched += unmatched_amount
+
+                # Match against loaded persons list, or use OCR name directly
+                person_key = name
                 for person in self.persons:
                     if unidecode(person['name']).lower() == name.lower():
-                        matched_person = person
+                        person_key = person['name']
                         break
 
-                if matched_person:
-                    person_key = matched_person['name']
-                    if person_key in payments_json:
-                        payments_json[person_key]['coke'] += coke_amount
-                        payments_json[person_key]['beer'] += beer_amount
-                        payments_json[person_key]['unmatched'] += unmatched_amount
-                    else:
-                        payments_json[person_key] = {
-                            'email': matched_person['email'],
-                            'coke': coke_amount,
-                            'beer': beer_amount,
-                            'unmatched': unmatched_amount
-                        }
+                if person_key in payments_json:
+                    for drink_id in amounts:
+                        payments_json[person_key]['drinks'][drink_id] += amounts[drink_id]
+                    payments_json[person_key]['unmatched'] += unmatched_amount
+                    payments_json[person_key]['unmatched_chars'] += unmatched_chars
                 else:
-                    print(f"{bcolors.WARNING}{bcolors.BOLD}No match found for name: {name}{bcolors.ENDC}")
+                    payments_json[person_key] = {
+                        'drinks': dict(amounts),
+                        'unmatched': unmatched_amount,
+                        'unmatched_chars': list(unmatched_chars)
+                    }
 
             
             # Update the UI with total values
-            self.total_coke_value.configure(text=str(total_coke_sold))
-            self.total_beer_value.configure(text=str(total_beer_sold))
+            for drink in self.drinks:
+                if drink["id"] in self.drink_sold_values:
+                    self.drink_sold_values[drink["id"]].configure(text=str(total_sold[drink["id"]]))
             self.total_earnings_value.configure(text=str(total_earnings))
             self.total_unmatched_value.configure(text=str(total_unmatched))
-            
-            #Print it
-            print(f"""
-{bcolors.OKCYAN}Total Coke Sold: {total_coke_sold}{bcolors.ENDC}
-{bcolors.OKCYAN}Total Beer Sold: {total_beer_sold}{bcolors.ENDC}
-{bcolors.OKCYAN}Earning: {total_earnings}{bcolors.ENDC}
-{bcolors.WARNING}Unmatched Amount: {total_unmatched}{bcolors.ENDC}
-    """)
+
             # Generate JSON
             json_output = []
+            drink_name_lookup = {drink["id"]: drink["name"] for drink in self.drinks}
             for person_name, data in payments_json.items():
-                
-
-                
-                coke_amount = data['coke']
-                beer_amount = data['beer']
-                coke_cost = coke_amount * coke_price
-                beer_cost = beer_amount * beer_price
-                total_price = coke_cost + beer_cost
+                person_drinks = data['drinks']
                 unmatched_amount = data['unmatched']
-                
-                
-                                                # Print unmatched amount for the current person
-                print(f"""
-{bcolors.HEADER}{bcolors.BOLD}Name: {person_name}{bcolors.ENDC}
-{bcolors.OKCYAN}Coke Amount: {coke_amount}{bcolors.ENDC}
-{bcolors.OKCYAN}Beer Amount: {beer_amount}{bcolors.ENDC}
-{bcolors.WARNING}Unmatched Amount: {unmatched_amount}{bcolors.ENDC}
-    """)
-                
+                total_chars = sum(person_drinks.values()) + unmatched_amount
+                total_price = sum(person_drinks[d_id] * drink_prices[d_id] for d_id in person_drinks)
+
+                if total_chars == 0:
+                    continue
+
+                # Print per-person summary
+                print(f"\n{bcolors.HEADER}{bcolors.BOLD}Name: {person_name}{bcolors.ENDC}")
+                for d_id, count in person_drinks.items():
+                    print(f"{bcolors.OKCYAN}{drink_name_lookup[d_id]} Amount: {count}{bcolors.ENDC}")
+                print(f"{bcolors.WARNING}Unmatched Amount: {unmatched_amount}{bcolors.ENDC}")
+
                 qr_code_url = "No bank account configured"
-                if total_price > 0 and self.preferences["bank_account"] != " ":
+                if total_price > 0 and self.preferences.get("bank_account", " ") != " ":
                     try:
                         bank_account_parts = self.preferences["bank_account"].strip().split("/")
                         bank_account = ''.join(c for c in bank_account_parts[0].strip() if c.isdigit())
                         bank_code = ''.join(c for c in bank_account_parts[1].strip()) if len(bank_account_parts) > 1 else ""
+                        event_name = self.preferences.get("event_name", "")
+                        qr_message = f"{event_name} - {person_name}" if event_name else person_name
                         qr_code_url = generate_czech_qr_code(
-                            "https://api.paylibo.com/paylibo",
+                            self.preferences["qr_code_server_url"],
                             account_number=bank_account,
                             bank_code=bank_code,
                             amount=total_price,
-                            message=f"Platba za nápoje: Kofola: {coke_amount}x Pivo: {beer_amount}x",
+                            message=qr_message,
                             size=200
                         )
                     except Exception as e:
                         print(f"Error generating QR code: {e}")
+
+                # Build facts dynamically
+                facts = []
+                for d_id, count in person_drinks.items():
+                    cost = count * drink_prices[d_id]
+                    facts.append({"title": f"Počet {drink_name_lookup[d_id]}:", "value": str(count)})
+                    facts.append({"title": f"Celková cena za {drink_name_lookup[d_id]}:", "value": f"{cost} Kč"})
+                facts.append({"title": "Celková cena za vše:", "value": f"{total_price} Kč"})
 
                 json_output.append({
                     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -642,24 +952,149 @@ class PayMeADrink:
                     "version": "1.2",
                     "body": [
                         {"type": "TextBlock", "text": f"Shrnutí pro {person_name}", "size": "Medium", "weight": "Bolder"},
-                        {"type": "TextBlock", "text": f"Email: {data['email']}", "wrap": True},
-                        {"type": "FactSet", "facts": [
-                            {"title": "Počet Kofol:", "value": str(coke_amount)},
-                            {"title": "Celková cena za Kofoly", "value": f"{coke_cost} Kč"},
-                            {"title": "Počet piv:", "value": str(beer_amount)},
-                            {"title": "Celková cena za piva:", "value": f"{beer_cost} Kč"},
-                            {"title": "Celková cena za vše:", "value": f"{total_price} Kč"}
-                        ]},
+                        {"type": "FactSet", "facts": facts},
                         {"type": "Image", "url": qr_code_url, "size": "Medium"}
                     ]
                 })
 
             # Save JSON to file
-            json_file_path = os.path.join(program_files_folder_path, "payments.json")
+            json_file_path = os.path.join(self.preferences["program_files_folder"], "payments.json")
             with open(json_file_path, "w", encoding="utf-8") as jsonfile:
                 dump(json_output, jsonfile, ensure_ascii=False, indent=4)
 
             print(f"Payments JSON generated successfully as '{json_file_path}'.")
+
+            # Save CSV summary
+            csv_file_path = os.path.join(self.preferences["program_files_folder"], "payments.csv")
+            with open(csv_file_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile, delimiter=";")
+                writer.writerow(["name", "total_amount"])
+                for person_name, data in payments_json.items():
+                    total = sum(data['drinks'][d_id] * drink_prices[d_id] for d_id in data['drinks'])
+                    if total > 0:
+                        writer.writerow([person_name, total])
+            print(f"CSV summary saved as '{csv_file_path}'.")
+
+            # Resolve unmatched characters before generating messages
+            people_with_unmatched = {
+                name: data for name, data in payments_json.items()
+                if data.get('unmatched_chars')
+            }
+            if people_with_unmatched:
+                print(f"\n{bcolors.FAIL}{bcolors.BOLD}=== UNRESOLVED CHARACTERS ==={bcolors.ENDC}")
+                print(f"The following people have unrecognised characters that need to be resolved.")
+                print(f"Available drinks:")
+                for drink in self.drinks:
+                    chars = ", ".join(drink["characters"])
+                    print(f"  {bcolors.OKCYAN}{drink['id']}{bcolors.ENDC} - {drink['name']} (characters: {chars})")
+                print()
+
+                for person_name, data in people_with_unmatched.items():
+                    for char in data['unmatched_chars']:
+                        while True:
+                            print(f"{bcolors.WARNING}{person_name}{bcolors.ENDC}: unrecognised character '{bcolors.BOLD}{char}{bcolors.ENDC}'")
+                            choice = input(f"  Assign to which drink ID? (or 'skip' to ignore): ").strip()
+                            if choice == "skip":
+                                data['unmatched'] -= 1
+                                total_unmatched -= 1
+                                break
+                            elif choice in drink_prices:
+                                data['drinks'][choice] = data['drinks'].get(choice, 0) + 1
+                                total_sold[choice] = total_sold.get(choice, 0) + 1
+                                data['unmatched'] -= 1
+                                total_unmatched -= 1
+                                total_earnings += drink_prices[choice]
+                                break
+                            else:
+                                print(f"  {bcolors.FAIL}Unknown drink ID. Try again.{bcolors.ENDC}")
+
+                    data['unmatched_chars'] = []
+
+                # Update UI after resolution
+                for drink in self.drinks:
+                    if drink["id"] in self.drink_sold_values:
+                        self.drink_sold_values[drink["id"]].configure(text=str(total_sold[drink["id"]]))
+                self.total_earnings_value.configure(text=str(total_earnings))
+                self.total_unmatched_value.configure(text=str(total_unmatched))
+                print(f"\n{bcolors.OKGREEN}All characters resolved. Generating messages...{bcolors.ENDC}")
+
+            # Generate messages for participants
+            message_template = self.preferences.get("message_template", "")
+            if message_template:
+                messages = []
+                for person_key, data in payments_json.items():
+                    # Persons from CSV are keyed as "Surname First"; use the original "First Surname"
+                    person_name = next((p['full_name'] for p in self.persons
+                                        if p['name'] == person_key and 'full_name' in p), person_key)
+                    person_drinks = data['drinks']
+                    total_chars = sum(person_drinks.values())
+                    if total_chars == 0:
+                        continue
+
+                    total_price = sum(person_drinks[d_id] * drink_prices[d_id] for d_id in person_drinks)
+                    drinks_summary = "".join(
+                        f"<li>{drink_name_lookup[d_id]}: {count}x ({count * drink_prices[d_id]} Kč)</li>"
+                        for d_id, count in person_drinks.items() if count > 0
+                    )
+
+                    qr_url = ""
+                    if total_price > 0 and self.preferences.get("bank_account", " ") != " ":
+                        try:
+                            bank_account_parts = self.preferences["bank_account"].strip().split("/")
+                            acc = ''.join(c for c in bank_account_parts[0].strip() if c.isdigit())
+                            code = ''.join(c for c in bank_account_parts[1].strip()) if len(bank_account_parts) > 1 else ""
+                            event_name = self.preferences.get("event_name", "")
+                            qr_message = f"{event_name} - {person_name}" if event_name else person_name
+                            qr_url = generate_czech_qr_code(
+                                self.preferences["qr_code_server_url"],
+                                account_number=acc,
+                                bank_code=code,
+                                amount=total_price,
+                                message=qr_message,
+                                size=200
+                            )
+                        except Exception:
+                            qr_url = ""
+
+                    qr_html = f'<img src="{qr_url}" alt="QR platba">' if qr_url else ""
+
+                    message = message_template.format(
+                        name=person_name,
+                        event_name=self.preferences.get("event_name", ""),
+                        organizer_name=self.preferences.get("organizer_name", ""),
+                        drinks_summary=drinks_summary,
+                        total_price=total_price,
+                        bank_account=self.preferences.get("bank_account", ""),
+                        qr_code_url=qr_html
+                    )
+                    # Generate email as "first.surname" from the CSV key "Surname First [Middle]":
+                    # "Novák Jan" → "jan.novak@studentstc.cz" (middle names are ignored)
+                    name_parts = unidecode(person_key).lower().split()
+                    if len(name_parts) > 1:
+                        email = f"{name_parts[1]}.{name_parts[0]}@studentstc.cz"
+                    else:
+                        email = f"{name_parts[0]}@studentstc.cz"
+
+                    messages.append({"email": email, "message": message})
+
+                messages_file_path = os.path.join(self.preferences["program_files_folder"], "messages.json")
+                with open(messages_file_path, "w", encoding="utf-8") as f:
+                    dump(messages, f, ensure_ascii=False, indent=4)
+                print(f"Messages generated successfully as '{messages_file_path}'.")
+
+            # Print totals
+            print(f"\n{bcolors.HEADER}=== OVERVIEW ==={bcolors.ENDC}")
+            for drink in self.drinks:
+                print(f"{bcolors.OKCYAN}Total {drink['name']} Sold: {total_sold[drink['id']]}{bcolors.ENDC}")
+            print(f"{bcolors.OKCYAN}Earning: {total_earnings}{bcolors.ENDC}")
+            print(f"{bcolors.WARNING}Unmatched Amount: {total_unmatched}{bcolors.ENDC}")
+
+            # List people with unrecognised characters
+            people_with_unmatched = [name for name, data in payments_json.items() if data['unmatched'] > 0]
+            if people_with_unmatched:
+                print(f"\n{bcolors.FAIL}{bcolors.BOLD}People with unrecognised characters:{bcolors.ENDC}")
+                for name in people_with_unmatched:
+                    print(f"  {bcolors.WARNING}- {name} ({payments_json[name]['unmatched']} unrecognised){bcolors.ENDC}")
         else:
             print("No scanned file selected.")
 
