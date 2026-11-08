@@ -17,6 +17,7 @@ import pprint
 from PyPDF2 import PdfReader, PdfWriter
 from io import BytesIO
 from json import dump
+import base64
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import letter
@@ -24,7 +25,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import fitz  # PyMuPDF
-from handwriting_ocr import LetterClassifier, analyze_scan, annotate_pdf
+from handwriting_ocr import (LetterClassifier, analyze_scan, annotate_pdf, encode_jpeg_within, final_pdf,
+                             person_row_images)
 
 load_dotenv()
 
@@ -34,6 +36,9 @@ INSTRUCTIONS_FILE = os.getenv("INSTRUCTIONS_FILE", "instructions.json")
 DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
 # "local" = handwriting_ocr (Tesseract + own letter model), "azure" = Azure Read OCR
 OCR_ENGINE = os.getenv("OCR_ENGINE", "local").lower()
+# Teams messages sent by the Power Automate Flow bot are size limited: in a test a 19.3 kB message
+# with an inline image went through, a 28.5 kB one did not. The row image is shrunk to stay below this.
+TEAMS_MESSAGE_MAX_BYTES = int(os.getenv("TEAMS_MESSAGE_MAX_BYTES", 19 * 1024))
 
 class bcolors:
     HEADER = '\033[95m'
@@ -627,6 +632,7 @@ class PayMeADrink:
         self.persons = []
         
         self.scanned_file_path = None
+        self.scan_pages = None  # result of the local recognition, used for the final PDF
         
         self.app.mainloop()
 
@@ -848,7 +854,9 @@ class PayMeADrink:
         entries = []
         for i in range(0, len(final_text) - 1, 2):
             name = " ".join(re.findall(r'[A-Z][a-z]*', final_text[i]))
-            entries.append((name, list(final_text[i + 1])))
+            chars = list(final_text[i + 1])
+            entries.append((name, chars, [None] * len(chars)))
+        self.scan_pages = None
         return entries
 
     def sheet_pages(self):
@@ -857,6 +865,19 @@ class PayMeADrink:
         labels = [unidecode(p['name']) for p in self.persons for _ in range(lines_per_person)]
         per_page = self.preferences["max_persons_per_page"]
         return [labels[i:i + per_page] for i in range(0, len(labels), per_page)]
+
+    def open_file(self, path):
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+    def drink_char(self, drink_id):
+        """Character shown for a drink in the final PDF (its first configured character)."""
+        drink = next(d for d in self.drinks if d["id"] == drink_id)
+        return drink["characters"][0].upper() if drink.get("characters") else drink_id
 
     def drink_for_char(self, char):
         """Drink id for a character; letters match regardless of case."""
@@ -890,12 +911,8 @@ class PayMeADrink:
         os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
         annotate_pdf(pages, output_pdf_path)
         print(f"PDF with recognised characters saved to {output_pdf_path}")
-        if sys.platform == "win32":
-            os.startfile(output_pdf_path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", output_pdf_path])
-        else:
-            subprocess.Popen(["xdg-open", output_pdf_path])
+        self.open_file(output_pdf_path)
+        self.scan_pages = pages
 
         entries = []
         for page in pages:
@@ -911,7 +928,7 @@ class PayMeADrink:
                         tokens.append(g.char)
                     else:
                         tokens.append(f"{g.guess}? {g.confidence:.0%} (page {page_no})")
-                entries.append((row.name, tokens))
+                entries.append((row.name, tokens, list(row.glyphs)))
                 if DEBUG:
                     source = "inferred from position" if row.name_inferred else f"OCR {row.name_score:.2f}"
                     print(f"  page {page_no}: {row.name} ({source}): {tokens}")
@@ -940,20 +957,24 @@ class PayMeADrink:
             unresolved = []
 
             # First parse all the data and aggregate by person
-            for name, drink_text in entries:
+            for name, drink_text, glyphs in entries:
                 if DEBUG:
                     print(f"\n{bcolors.OKCYAN}Processing: name='{name}', drinks={drink_text}{bcolors.ENDC}")
 
                 amounts = {drink["id"]: 0 for drink in self.drinks}
                 unmatched_amount = 0
                 unmatched_chars = []
-                for char in drink_text:
+                unmatched_glyphs = []
+                for char, glyph in zip(drink_text, glyphs):
                     drink_id = self.drink_for_char(char)
                     if drink_id:
                         amounts[drink_id] += 1
+                        if glyph:
+                            glyph.final, glyph.final_source = self.drink_char(drink_id), "auto"
                     elif char.strip() != "":
                         unmatched_amount += 1
                         unmatched_chars.append(char)
+                        unmatched_glyphs.append(glyph)
                         print(f"Unmatched character found in the scanned text. {bcolors.WARNING}{char}{bcolors.ENDC}")
 
                 person_earnings = 0
@@ -981,7 +1002,7 @@ class PayMeADrink:
                         'unmatched': unmatched_amount,
                         'unmatched_chars': list(unmatched_chars)
                     }
-                unresolved.extend((person_key, char) for char in unmatched_chars)
+                unresolved.extend((person_key, char, glyph) for char, glyph in zip(unmatched_chars, unmatched_glyphs))
 
             
             # Update the UI with total values
@@ -1002,7 +1023,7 @@ class PayMeADrink:
                     print(f"  {bcolors.OKCYAN}{drink['id']}{bcolors.ENDC} - {drink['name']} (characters: {chars})")
                 print()
 
-                for number, (person_name, char) in enumerate(unresolved, start=1):
+                for number, (person_name, char, glyph) in enumerate(unresolved, start=1):
                     data = payments_json[person_name]
                     # Local OCR describes uncertain glyphs as "T? 62% (page 3)": offer the guess as default
                     if char.startswith("crossed out"):
@@ -1018,6 +1039,8 @@ class PayMeADrink:
                         if choice == "skip":
                             data['unmatched'] -= 1
                             total_unmatched -= 1
+                            if glyph:
+                                glyph.final, glyph.final_source = None, "skipped"
                             break
                         elif choice in drink_prices:
                             data['drinks'][choice] = data['drinks'].get(choice, 0) + 1
@@ -1025,6 +1048,8 @@ class PayMeADrink:
                             data['unmatched'] -= 1
                             total_unmatched -= 1
                             total_earnings += drink_prices[choice]
+                            if glyph:
+                                glyph.final, glyph.final_source = self.drink_char(choice), "operator"
                             break
                         else:
                             print(f"  {bcolors.FAIL}Unknown drink ID. Try again.{bcolors.ENDC}")
@@ -1039,6 +1064,13 @@ class PayMeADrink:
                 self.total_earnings_value.configure(text=str(total_earnings))
                 self.total_unmatched_value.configure(text=str(total_unmatched))
                 print(f"\n{bcolors.OKGREEN}All characters resolved. Generating messages...{bcolors.ENDC}")
+
+            # PDF with the final characters of every row, after the operator's decisions
+            if self.scan_pages:
+                final_pdf_path = os.path.join(self.preferences["program_files_folder"], "final_scan.pdf")
+                final_pdf(self.scan_pages, final_pdf_path)
+                print(f"PDF with final characters saved to {final_pdf_path}")
+                self.open_file(final_pdf_path)
 
             # Generate JSON
             json_output = []
@@ -1117,6 +1149,9 @@ class PayMeADrink:
             # Generate messages for participants
             message_template = self.preferences.get("message_template", "")
             if message_template:
+                # Cut-outs of each person's rows from the final scan, embedded in the message so they
+                # can check them (Teams Flow bot cannot send file attachments)
+                row_images = person_row_images(self.scan_pages) if self.scan_pages else {}
                 messages = []
                 for person_key, data in payments_json.items():
                     # Persons from CSV are keyed as "Surname First"; use the original "First Surname"
@@ -1154,15 +1189,36 @@ class PayMeADrink:
 
                     qr_html = f'<img src="{qr_url}" alt="QR platba">' if qr_url else ""
 
-                    message = message_template.format(
+                    template_values = dict(
                         name=person_name,
                         event_name=self.preferences.get("event_name", ""),
                         organizer_name=self.preferences.get("organizer_name", ""),
                         drinks_summary=drinks_summary,
                         total_price=total_price,
                         bank_account=self.preferences.get("bank_account", ""),
-                        qr_code_url=qr_html
+                        qr_code_url=qr_html,
+                        rows_image=""
                     )
+                    message = message_template.format(**template_values)
+
+                    # Inline image of the person's rows: at {rows_image} in the template, or appended.
+                    # JPEG quality/size is lowered until the whole message fits the Teams limit.
+                    image = row_images.get(unidecode(person_key))
+                    if image is not None:
+                        prefix = 'Tvoje řádky ze seznamu:<br><img src="data:image/jpeg;base64,'
+                        suffix = '" alt="Tvoje řádky ze seznamu">'
+                        separator = "" if "{rows_image}" in message_template else "<br><br>"
+                        fixed = len((message + separator + prefix + suffix).encode("utf-8"))
+                        jpg = encode_jpeg_within(image, (TEAMS_MESSAGE_MAX_BYTES - fixed) * 3 // 4)
+                        if jpg:
+                            rows_html = prefix + base64.b64encode(jpg).decode("ascii") + suffix
+                            if "{rows_image}" in message_template:
+                                message = message_template.format(**{**template_values, "rows_image": rows_html})
+                            else:
+                                message += separator + rows_html
+                        else:
+                            print(f"{bcolors.WARNING}{person_name}: rows image does not fit into the message, "
+                                  f"sent without it.{bcolors.ENDC}")
                     # Prefer the email from the CSV; otherwise build "first.surname" from the key
                     # "Surname First [Middle]": "Novák Jan" → "jan.novak@studentstc.cz" (middle names ignored)
                     email = next((p.get('email') for p in self.persons

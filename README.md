@@ -34,6 +34,10 @@ By default the scan is recognised locally (`handwriting_ocr.py`), no cloud servi
 
 `program_files/annotated_scan.pdf` shows the result: green = accepted, red = needs confirmation, grey = crossed out, orange = outside of any row.
 
+Every message in `program_files/messages.json` contains an inline grayscale image of the person's rows cut out of the scan, with the final characters of each row on the right (placeholder `{rows_image}` in the message template, otherwise appended at the end). Messages are sent to Teams by the Power Automate Flow bot, which limits the message size, so the image is shrunk until the whole message fits into `TEAMS_MESSAGE_MAX_BYTES` (default 19 kB, can be changed in `.env`).
+
+After the manual resolution `program_files/final_scan.pdf` shows the final characters of every row (right column) and of every glyph: green = accepted automatically, blue = confirmed by the operator, grey struck through = ignored.
+
 Please ask people to write with a **blue pen** - black ink cannot be told apart from the printed sheet.
 
 ### Training the letter model

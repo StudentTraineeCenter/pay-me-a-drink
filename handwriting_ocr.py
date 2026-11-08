@@ -40,6 +40,9 @@ class Glyph:
     confidence: float = 0.0
     crossed_out: bool = False
     image: np.ndarray = None  # 28x28 classifier input, for debugging
+    # Outcome after manual resolution: final character (None = ignored) and who decided it
+    final: str = None
+    final_source: str = None  # "auto", "operator" or "skipped"
 
 
 @dataclass
@@ -60,6 +63,7 @@ class PageResult:
     image: np.ndarray
     rows: list
     stray_glyphs: list  # ink that does not belong to any row
+    pitch: float = 0.0  # distance between rows in pixels
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +489,7 @@ def analyze_scan(pdf_path, sheet_pages, allowed_chars, classifier=None, min_conf
             if g.confidence >= min_confidence and not too_narrow:
                 g.char = g.guess
 
-        pages.append(PageResult(index=page_index, image=img, rows=rows, stray_glyphs=stray))
+        pages.append(PageResult(index=page_index, image=img, rows=rows, stray_glyphs=stray, pitch=pitch))
     return pages
 
 
@@ -516,9 +520,127 @@ def annotate_pdf(pages, output_pdf_path):
             cv2.rectangle(img, (gx0, gy0), (gx1, gy1), (0, 140, 255), 2)
             cv2.putText(img, "mimo radek", (gx0, gy0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
-        ok, png = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        pdf_page = doc.new_page(width=img.shape[1], height=img.shape[0])
-        pdf_page.insert_image(pdf_page.rect, stream=png.tobytes())
+        _add_image_page(doc, img)
     doc.save(output_pdf_path)
     doc.close()
     return output_pdf_path
+
+
+FINAL_COLORS = {"auto": (0, 150, 0), "operator": (200, 90, 0), "skipped": (140, 140, 140)}
+
+
+def draw_final_page(page, only_row=None):
+    """Page image with the final characters (after manual resolution) drawn over it.
+
+    Full page: each glyph gets its final character (green = accepted automatically, blue = confirmed
+    by the operator, grey struck through = ignored) and every row its resulting string on the right.
+
+    With only_row (per-person cut-outs): only that row's resulting string is drawn, bigger and without
+    glyph boxes, so it stays readable after heavy compression; an empty row shows "-".
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    img = page.image.copy()
+    for row in page.rows:
+        if only_row is not None:
+            if row is not only_row:
+                continue
+        elif not row.glyphs:
+            continue
+
+        if only_row is None:
+            for g in row.glyphs:
+                gx0, gy0, gx1, gy1 = g.bbox
+                color = FINAL_COLORS.get(g.final_source, (0, 0, 230))
+                cv2.rectangle(img, (gx0, gy0), (gx1, gy1), color, 2)
+                if g.final_source == "skipped":
+                    cv2.line(img, (gx0, gy1), (gx1, gy0), color, 2)
+                else:
+                    cv2.putText(img, g.final or "?", (gx0, gy0 - 6), font, 0.8, color, 2)
+
+        # Resulting characters of the row, right-aligned at the end of the underline
+        text = " ".join(g.final for g in row.glyphs if g.final) or "-"
+        scale, thickness = (1.1, 3) if only_row is None else (1.6, 4)
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+        slope, intercept, _, x1 = row.line
+        right = int(min(x1, img.shape[1] - 10))
+        bottom = int(slope * right + intercept) - 8
+        cv2.rectangle(img, (right - tw - 16, bottom - th - 14), (right, bottom + 4), (255, 255, 255), -1)
+        cv2.rectangle(img, (right - tw - 16, bottom - th - 14), (right, bottom + 4), (60, 60, 60), 2)
+        cv2.putText(img, text, (right - tw - 8, bottom - 5), font, scale, (20, 20, 20), thickness)
+
+    for g in (page.stray_glyphs if only_row is None else []):
+        gx0, gy0, gx1, gy1 = g.bbox
+        cv2.rectangle(img, (gx0, gy0), (gx1, gy1), (0, 140, 255), 2)
+        cv2.putText(img, "mimo radek", (gx0, gy0 - 6), font, 0.6, (0, 140, 255), 2)
+    return img
+
+
+def final_pdf(pages, output_pdf_path):
+    """Write a PDF with the final characters of every row (see draw_final_page)."""
+    doc = fitz.open()
+    for page in pages:
+        _add_image_page(doc, draw_final_page(page))
+    doc.save(output_pdf_path)
+    doc.close()
+    return output_pdf_path
+
+
+def person_row_images(pages):
+    """Grayscale image with all rows of each person cut out of the scan, stacked in scan order.
+
+    Returns {row name (label as printed on the sheet): image}. Every row of the person is included,
+    empty ones too, so they can check nothing is missing. Encode with encode_jpeg_within().
+    """
+    crops = {}
+    for page in pages:
+        if not page.rows:
+            continue
+        h, w = page.image.shape[:2]
+        for i, row in enumerate(page.rows):
+            img = draw_final_page(page, only_row=row)
+            slope, intercept, x0, x1 = row.line
+            line_top = min(slope * x0 + intercept, slope * x1 + intercept)
+            line_bottom = max(slope * x0 + intercept, slope * x1 + intercept)
+            # From just above the handwriting (bounded by the previous underline) to below this underline
+            top = line_top - page.pitch * 1.05
+            if i > 0:
+                prev = page.rows[i - 1].line
+                top = max(top, min(prev[0] * prev[2] + prev[1], prev[0] * prev[3] + prev[1]) - 4)
+            bottom = line_bottom + page.pitch * 0.12
+            for g in row.glyphs:
+                top, bottom = min(top, g.bbox[1] - 6), max(bottom, g.bbox[3] + 6)
+            left, right = max(0, int(x0 - 20)), min(w, int(x1 + 20))
+            crop = img[max(0, int(top)):min(h, int(bottom)), left:right]
+            if crop.size:
+                crops.setdefault(row.name, []).append(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY))
+
+    result = {}
+    for name, parts in crops.items():
+        width = max(p.shape[1] for p in parts)
+        resized = [cv2.resize(p, (width, max(1, int(p.shape[0] * width / p.shape[1])))) for p in parts]
+        separator = np.full((8, width), 160, np.uint8)
+        stacked = [resized[0]]
+        for part in resized[1:]:
+            stacked += [separator, part]
+        result[name] = np.vstack(stacked)
+    return result
+
+
+def encode_jpeg_within(img, max_bytes, widths=(600, 550, 500, 450, 400, 350),
+                       qualities=(60, 50, 40, 30)):
+    """Largest/best JPEG of img that fits into max_bytes (None if even the smallest does not)."""
+    for width in widths:
+        width = min(width, img.shape[1])
+        resized = cv2.resize(img, (width, max(1, int(img.shape[0] * width / img.shape[1]))),
+                             interpolation=cv2.INTER_AREA)
+        for quality in qualities:
+            jpg = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes()
+            if len(jpg) <= max_bytes:
+                return jpg
+    return None
+
+
+def _add_image_page(doc, img):
+    _, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    pdf_page = doc.new_page(width=img.shape[1], height=img.shape[0])
+    pdf_page.insert_image(pdf_page.rect, stream=jpg.tobytes())
