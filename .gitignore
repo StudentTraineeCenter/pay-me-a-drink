@@ -6,3 +6,5 @@ pyvenv.cfg
 *.json
 *.pdf
 *.csv
+.cache/
+__pycache__/

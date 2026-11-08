@@ -24,6 +24,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import fitz  # PyMuPDF
+from handwriting_ocr import LetterClassifier, analyze_scan, annotate_pdf
 
 load_dotenv()
 
@@ -31,6 +32,8 @@ PREFERENCES_FILE = os.getenv("PREFERENCES_FILE", "preferences.json")
 DRINKS_FILE = os.getenv("DRINKS_FILE", "drinks.json")
 INSTRUCTIONS_FILE = os.getenv("INSTRUCTIONS_FILE", "instructions.json")
 DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
+# "local" = handwriting_ocr (Tesseract + own letter model), "azure" = Azure Read OCR
+OCR_ENGINE = os.getenv("OCR_ENGINE", "local").lower()
 
 class bcolors:
     HEADER = '\033[95m'
@@ -473,6 +476,27 @@ def generate_czech_qr_code(server_url, account_prefix=None, account_number=None,
     return f"{url}?{query_string}"
 
 
+def load_persons(file_path):
+    """Load people from CSV rows "First [Middle] Surname;email".
+
+    The sheet is printed and checked as "@Surname First [Middle]@", so the name is flipped into
+    that form and used as the key ("Jan Novák" → "Novák Jan"). The original order is kept as
+    full_name for messages. Persons are sorted by the key in Czech alphabetical order.
+    """
+    persons = []
+    with open(file_path, newline='', encoding='utf-8') as csvfile:
+        for row in csv.reader(csvfile, delimiter=';'):
+            if len(row) >= 1 and row[0].strip():
+                parts = row[0].split()
+                persons.append({
+                    'name': " ".join(parts[-1:] + parts[:-1]),
+                    'full_name': " ".join(parts),
+                    'email': row[1].strip() if len(row) >= 2 else "",
+                })
+    persons.sort(key=lambda p: czech_sort_key(p['name']))
+    return persons
+
+
 class PayMeADrink:
     def __init__(self):
         self.app = ctk.CTk()
@@ -612,22 +636,9 @@ class PayMeADrink:
             filename = os.path.basename(file_path)
             self.file_button.configure(text=filename)
 
-            with open(file_path, newline='', encoding='utf-8') as csvfile:
-                reader = csv.reader(csvfile, delimiter=';')
-                for row in reader:
-                    if len(row) >= 1 and row[0].strip():
-                        # CSV holds "Surname First [Middle]"; keep it as the key and
-                        # build the natural "First [Middle] Surname" form for messages/emails
-                        parts = row[0].split()
-                        name = " ".join(parts)
-                        full_name = " ".join(parts[1:] + parts[:1])
-                        self.persons.append({'name': name, 'full_name': full_name})
-
-                # Sort by surname, then first/middle names (Czech alphabetical order)
-                self.persons.sort(key=lambda p: czech_sort_key(p['name']))
-
-                print(bcolors.HEADER + bcolors.BOLD + "Loaded data:" + bcolors.ENDC)
-                pprint.pprint(self.persons)
+            self.persons = load_persons(file_path)
+            print(bcolors.HEADER + bcolors.BOLD + "Loaded data:" + bcolors.ENDC)
+            pprint.pprint(self.persons)
         else:
             self.file_button.configure(text="Prozkoumat")
             
@@ -735,104 +746,186 @@ class PayMeADrink:
         save_preferences(self.preferences)
         print("Preferences saved. Drinks:", self.drinks, "Preferences:", self.preferences)
      
+    def read_scan_azure(self):
+        """Azure Read OCR (original engine). Returns [(name, [characters])] in sheet order."""
+        api_key = AZURE_API_KEY
+        endpoint = AZURE_ENDPOINT
+        client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(api_key))
+
+        final_text = ""
+        # Dictionary to store bounding boxes for each page
+        all_bounding_boxes = {}
+
+        # Read the original PDF
+        original_pdf = PdfReader(open(self.scanned_file_path, "rb"))
+
+        # Process each page individually
+        for page_num in range(len(original_pdf.pages)):
+            # Create a single-page PDF in memory
+            writer = PdfWriter()
+            writer.add_page(original_pdf.pages[page_num])
+
+            byte_stream = BytesIO()
+            writer.write(byte_stream)
+            byte_stream.seek(0)  # Reset stream position to beginning
+
+            # Send to Azure OCR
+            try:
+                response = client.read_in_stream(byte_stream, raw=True)
+            except Exception as e:
+                print(f"Error during OCR processing: {e}")
+
+            # Get operation ID
+            operation_location = response.headers["Operation-Location"]
+            operation_id = operation_location.split("/")[-1]
+
+            # Poll for results
+            while True:
+                result = client.get_read_result(operation_id)
+                if result.status not in ["notStarted", "running"]:
+                    break
+                print(f"Waiting for page {page_num + 1} result...")
+                time.sleep(1)
+
+            # Extract text and bounding boxes
+            page_boxes = []
+            if result.status == "succeeded":
+                for page in result.analyze_result.read_results:
+                    ocr_width = page.width  # Get width from OCR result
+                    ocr_height = page.height  # Get height from OCR result
+                    
+                    for line in page.lines:
+                        final_text += line.text + "\n"
+                        # Store bounding box information with page dimensions
+                        bounding_box = line.bounding_box
+                        page_boxes.append((line.text, bounding_box, ocr_width, ocr_height))
+                        
+                        # Print bounding box info for debugging
+                        # print(f"OCR Text: {line.text}")
+                        # print(f"Bounding Box: {bounding_box}")
+                        # print(f"OCR Page Dimensions: {ocr_width} x {ocr_height}")
+            else:
+                print(f"Analysis failed for page {page_num + 1}")
+            
+            all_bounding_boxes[page_num] = page_boxes
+
+        # Create annotated PDF with bounding boxes
+        output_pdf_path = os.path.join(self.preferences["program_files_folder"], "annotated_scan.pdf")
+        os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
+        annotated_pdf = draw_bounding_boxes_on_pdf(
+            self.scanned_file_path,
+            output_pdf_path,
+            all_bounding_boxes,
+            self.persons
+        )
+
+        if sys.platform == "win32":
+            os.startfile(annotated_pdf)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", annotated_pdf])
+        else:
+            subprocess.Popen(["xdg-open", annotated_pdf])
+
+        # Continue with existing processing
+        if DEBUG:
+            print(f"\n{bcolors.HEADER}=== RAW OCR TEXT ==={bcolors.ENDC}")
+            print(repr(final_text[:500]))
+
+        final_text = final_text.replace(" ", "").replace("-", "").replace("_", "").replace("Strana", "")
+        final_text = ''.join([i for i in final_text if not i.isdigit()])
+        final_text = final_text.split("@")[1:]
+
+        if DEBUG:
+            print(f"\n{bcolors.HEADER}=== PARSED SEGMENTS (split by @) ==={bcolors.ENDC}")
+            for idx, segment in enumerate(final_text):
+                label = "NAME" if idx % 2 == 0 else "DRINKS"
+                print(f"  [{idx}] {label}: {repr(segment.strip())}")
+            if self.persons:
+                print(f"\n{bcolors.HEADER}=== LOADED PERSONS ({len(self.persons)}) ==={bcolors.ENDC}")
+                for p in self.persons:
+                    print(f"  - {p['name']} → unidecode: {unidecode(p['name'])}")
+
+        entries = []
+        for i in range(0, len(final_text) - 1, 2):
+            name = " ".join(re.findall(r'[A-Z][a-z]*', final_text[i]))
+            entries.append((name, list(final_text[i + 1])))
+        return entries
+
+    def sheet_pages(self):
+        """Labels exactly as draw_person_list prints them, split into the pages of the sheet."""
+        lines_per_person = self.preferences["lines_per_person"]
+        labels = [unidecode(p['name']) for p in self.persons for _ in range(lines_per_person)]
+        per_page = self.preferences["max_persons_per_page"]
+        return [labels[i:i + per_page] for i in range(0, len(labels), per_page)]
+
+    def drink_for_char(self, char):
+        """Drink id for a character; letters match regardless of case."""
+        return (self.char_to_drink.get(char) or self.char_to_drink.get(char.upper())
+                or self.char_to_drink.get(char.lower()))
+
+    def read_scan_local(self):
+        """Local recognition (handwriting_ocr). Returns [(name, [tokens])] in sheet order.
+
+        A token is either a recognised drink character or a description of a glyph that has to be
+        confirmed by hand (uncertain or crossed out); those end up as unmatched characters.
+        """
+        if not self.persons:
+            print(f"{bcolors.FAIL}Load the CSV with people first - the names on the sheet are matched against it.{bcolors.ENDC}")
+            return None
+
+        allowed = [c for c in self.char_to_drink if c.isalpha()]
+        not_letters = [c for c in self.char_to_drink if not c.isalpha()]
+        if not_letters:
+            print(f"{bcolors.WARNING}Only letters can be recognised locally, ignoring drink characters: {not_letters}{bcolors.ENDC}")
+        try:
+            classifier = LetterClassifier()
+        except FileNotFoundError as e:
+            print(f"{bcolors.FAIL}{e}{bcolors.ENDC}")
+            return None
+
+        print("Recognising the scan locally...")
+        pages = analyze_scan(self.scanned_file_path, self.sheet_pages(), allowed, classifier)
+
+        output_pdf_path = os.path.join(self.preferences["program_files_folder"], "annotated_scan.pdf")
+        os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
+        annotate_pdf(pages, output_pdf_path)
+        print(f"PDF with recognised characters saved to {output_pdf_path}")
+        if sys.platform == "win32":
+            os.startfile(output_pdf_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", output_pdf_path])
+        else:
+            subprocess.Popen(["xdg-open", output_pdf_path])
+
+        entries = []
+        for page in pages:
+            page_no = page.index + 1
+            if not page.rows:
+                print(f"{bcolors.WARNING}Page {page_no}: no names from the list found, page skipped.{bcolors.ENDC}")
+            for row in page.rows:
+                tokens = []
+                for g in row.glyphs:
+                    if g.crossed_out:
+                        tokens.append(f"crossed out (page {page_no})")
+                    elif g.char:
+                        tokens.append(g.char)
+                    else:
+                        tokens.append(f"{g.guess}? {g.confidence:.0%} (page {page_no})")
+                entries.append((row.name, tokens))
+                if DEBUG:
+                    source = "inferred from position" if row.name_inferred else f"OCR {row.name_score:.2f}"
+                    print(f"  page {page_no}: {row.name} ({source}): {tokens}")
+            for g in page.stray_glyphs:
+                x0, y0, x1, y1 = g.bbox
+                print(f"{bcolors.FAIL}Page {page_no}: handwriting outside of any row at x={x0}, y={y0} - "
+                      f"check the annotated PDF and add it by hand.{bcolors.ENDC}")
+        return entries
+
     def generate_json_with_payments(self):
         if self.scanned_file_path:
-            api_key = AZURE_API_KEY
-            endpoint = AZURE_ENDPOINT
-            client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(api_key))
-
-            final_text = ""
-            # Dictionary to store bounding boxes for each page
-            all_bounding_boxes = {}
-
-            # Read the original PDF
-            original_pdf = PdfReader(open(self.scanned_file_path, "rb"))
-
-            # Process each page individually
-            for page_num in range(len(original_pdf.pages)):
-                # Create a single-page PDF in memory
-                writer = PdfWriter()
-                writer.add_page(original_pdf.pages[page_num])
-
-                byte_stream = BytesIO()
-                writer.write(byte_stream)
-                byte_stream.seek(0)  # Reset stream position to beginning
-
-                # Send to Azure OCR
-                try:
-                    response = client.read_in_stream(byte_stream, raw=True)
-                except Exception as e:
-                    print(f"Error during OCR processing: {e}")
-
-                # Get operation ID
-                operation_location = response.headers["Operation-Location"]
-                operation_id = operation_location.split("/")[-1]
-
-                # Poll for results
-                while True:
-                    result = client.get_read_result(operation_id)
-                    if result.status not in ["notStarted", "running"]:
-                        break
-                    print(f"Waiting for page {page_num + 1} result...")
-                    time.sleep(1)
-
-                # Extract text and bounding boxes
-                page_boxes = []
-                if result.status == "succeeded":
-                    for page in result.analyze_result.read_results:
-                        ocr_width = page.width  # Get width from OCR result
-                        ocr_height = page.height  # Get height from OCR result
-                        
-                        for line in page.lines:
-                            final_text += line.text + "\n"
-                            # Store bounding box information with page dimensions
-                            bounding_box = line.bounding_box
-                            page_boxes.append((line.text, bounding_box, ocr_width, ocr_height))
-                            
-                            # Print bounding box info for debugging
-                            # print(f"OCR Text: {line.text}")
-                            # print(f"Bounding Box: {bounding_box}")
-                            # print(f"OCR Page Dimensions: {ocr_width} x {ocr_height}")
-                else:
-                    print(f"Analysis failed for page {page_num + 1}")
-                
-                all_bounding_boxes[page_num] = page_boxes
-
-            # Create annotated PDF with bounding boxes
-            output_pdf_path = os.path.join(self.preferences["program_files_folder"], "annotated_scan.pdf")
-            os.makedirs(self.preferences["program_files_folder"], exist_ok=True)
-            annotated_pdf = draw_bounding_boxes_on_pdf(
-                self.scanned_file_path,
-                output_pdf_path,
-                all_bounding_boxes,
-                self.persons
-            )
-
-            if sys.platform == "win32":
-                os.startfile(annotated_pdf)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", annotated_pdf])
-            else:
-                subprocess.Popen(["xdg-open", annotated_pdf])
-
-            # Continue with existing processing
-            if DEBUG:
-                print(f"\n{bcolors.HEADER}=== RAW OCR TEXT ==={bcolors.ENDC}")
-                print(repr(final_text[:500]))
-
-            final_text = final_text.replace(" ", "").replace("-", "").replace("_", "").replace("Strana", "")
-            final_text = ''.join([i for i in final_text if not i.isdigit()])
-            final_text = final_text.split("@")[1:]
-
-            if DEBUG:
-                print(f"\n{bcolors.HEADER}=== PARSED SEGMENTS (split by @) ==={bcolors.ENDC}")
-                for idx, segment in enumerate(final_text):
-                    label = "NAME" if idx % 2 == 0 else "DRINKS"
-                    print(f"  [{idx}] {label}: {repr(segment.strip())}")
-                if self.persons:
-                    print(f"\n{bcolors.HEADER}=== LOADED PERSONS ({len(self.persons)}) ==={bcolors.ENDC}")
-                    for p in self.persons:
-                        print(f"  - {p['name']} → unidecode: {unidecode(p['name'])}")
+            entries = self.read_scan_azure() if OCR_ENGINE == "azure" else self.read_scan_local()
+            if entries is None:
+                return
 
             # Build price lookup from drinks config
             drink_prices = {drink["id"]: drink["price"] for drink in self.drinks}
@@ -842,24 +935,20 @@ class PayMeADrink:
             total_sold = {drink["id"]: 0 for drink in self.drinks}
             total_earnings = 0
             total_unmatched = 0
+            # Unmatched characters in the order they appear on the scan (page, row, left to right),
+            # so the manual check walks through the paper instead of jumping between pages
+            unresolved = []
 
             # First parse all the data and aggregate by person
-            for i in range(0, len(final_text), 2):
-                if i + 1 >= len(final_text):
-                    break
-
-                name = re.findall(r'[A-Z][a-z]*', final_text[i])
-                name = " ".join(name)
-                drink_text = final_text[i + 1]
-
+            for name, drink_text in entries:
                 if DEBUG:
-                    print(f"\n{bcolors.OKCYAN}Processing: name='{name}', drinks='{drink_text.strip()}'{bcolors.ENDC}")
+                    print(f"\n{bcolors.OKCYAN}Processing: name='{name}', drinks={drink_text}{bcolors.ENDC}")
 
                 amounts = {drink["id"]: 0 for drink in self.drinks}
                 unmatched_amount = 0
                 unmatched_chars = []
                 for char in drink_text:
-                    drink_id = self.char_to_drink.get(char)
+                    drink_id = self.drink_for_char(char)
                     if drink_id:
                         amounts[drink_id] += 1
                     elif char.strip() != "":
@@ -892,6 +981,7 @@ class PayMeADrink:
                         'unmatched': unmatched_amount,
                         'unmatched_chars': list(unmatched_chars)
                     }
+                unresolved.extend((person_key, char) for char in unmatched_chars)
 
             
             # Update the UI with total values
@@ -900,6 +990,55 @@ class PayMeADrink:
                     self.drink_sold_values[drink["id"]].configure(text=str(total_sold[drink["id"]]))
             self.total_earnings_value.configure(text=str(total_earnings))
             self.total_unmatched_value.configure(text=str(total_unmatched))
+
+
+            # Resolve unmatched characters before generating messages
+            if unresolved:
+                print(f"\n{bcolors.FAIL}{bcolors.BOLD}=== UNRESOLVED CHARACTERS ==={bcolors.ENDC}")
+                print(f"The following people have unrecognised characters that need to be resolved.")
+                print(f"Available drinks:")
+                for drink in self.drinks:
+                    chars = ", ".join(drink["characters"])
+                    print(f"  {bcolors.OKCYAN}{drink['id']}{bcolors.ENDC} - {drink['name']} (characters: {chars})")
+                print()
+
+                for number, (person_name, char) in enumerate(unresolved, start=1):
+                    data = payments_json[person_name]
+                    # Local OCR describes uncertain glyphs as "T? 62% (page 3)": offer the guess as default
+                    if char.startswith("crossed out"):
+                        default = "skip"
+                    elif len(char) > 1 and char[1] == "?":
+                        default = self.drink_for_char(char[0]) or ""
+                    else:
+                        default = ""
+                    hint = f", Enter = {default}" if default else ""
+                    while True:
+                        print(f"[{number}/{len(unresolved)}] {bcolors.WARNING}{person_name}{bcolors.ENDC}: unrecognised character '{bcolors.BOLD}{char}{bcolors.ENDC}'")
+                        choice = input(f"  Assign to which drink ID? (or 'skip' to ignore{hint}): ").strip() or default
+                        if choice == "skip":
+                            data['unmatched'] -= 1
+                            total_unmatched -= 1
+                            break
+                        elif choice in drink_prices:
+                            data['drinks'][choice] = data['drinks'].get(choice, 0) + 1
+                            total_sold[choice] = total_sold.get(choice, 0) + 1
+                            data['unmatched'] -= 1
+                            total_unmatched -= 1
+                            total_earnings += drink_prices[choice]
+                            break
+                        else:
+                            print(f"  {bcolors.FAIL}Unknown drink ID. Try again.{bcolors.ENDC}")
+
+                for data in payments_json.values():
+                    data['unmatched_chars'] = []
+
+                # Update UI after resolution
+                for drink in self.drinks:
+                    if drink["id"] in self.drink_sold_values:
+                        self.drink_sold_values[drink["id"]].configure(text=str(total_sold[drink["id"]]))
+                self.total_earnings_value.configure(text=str(total_earnings))
+                self.total_unmatched_value.configure(text=str(total_unmatched))
+                print(f"\n{bcolors.OKGREEN}All characters resolved. Generating messages...{bcolors.ENDC}")
 
             # Generate JSON
             json_output = []
@@ -975,49 +1114,6 @@ class PayMeADrink:
                         writer.writerow([person_name, total])
             print(f"CSV summary saved as '{csv_file_path}'.")
 
-            # Resolve unmatched characters before generating messages
-            people_with_unmatched = {
-                name: data for name, data in payments_json.items()
-                if data.get('unmatched_chars')
-            }
-            if people_with_unmatched:
-                print(f"\n{bcolors.FAIL}{bcolors.BOLD}=== UNRESOLVED CHARACTERS ==={bcolors.ENDC}")
-                print(f"The following people have unrecognised characters that need to be resolved.")
-                print(f"Available drinks:")
-                for drink in self.drinks:
-                    chars = ", ".join(drink["characters"])
-                    print(f"  {bcolors.OKCYAN}{drink['id']}{bcolors.ENDC} - {drink['name']} (characters: {chars})")
-                print()
-
-                for person_name, data in people_with_unmatched.items():
-                    for char in data['unmatched_chars']:
-                        while True:
-                            print(f"{bcolors.WARNING}{person_name}{bcolors.ENDC}: unrecognised character '{bcolors.BOLD}{char}{bcolors.ENDC}'")
-                            choice = input(f"  Assign to which drink ID? (or 'skip' to ignore): ").strip()
-                            if choice == "skip":
-                                data['unmatched'] -= 1
-                                total_unmatched -= 1
-                                break
-                            elif choice in drink_prices:
-                                data['drinks'][choice] = data['drinks'].get(choice, 0) + 1
-                                total_sold[choice] = total_sold.get(choice, 0) + 1
-                                data['unmatched'] -= 1
-                                total_unmatched -= 1
-                                total_earnings += drink_prices[choice]
-                                break
-                            else:
-                                print(f"  {bcolors.FAIL}Unknown drink ID. Try again.{bcolors.ENDC}")
-
-                    data['unmatched_chars'] = []
-
-                # Update UI after resolution
-                for drink in self.drinks:
-                    if drink["id"] in self.drink_sold_values:
-                        self.drink_sold_values[drink["id"]].configure(text=str(total_sold[drink["id"]]))
-                self.total_earnings_value.configure(text=str(total_earnings))
-                self.total_unmatched_value.configure(text=str(total_unmatched))
-                print(f"\n{bcolors.OKGREEN}All characters resolved. Generating messages...{bcolors.ENDC}")
-
             # Generate messages for participants
             message_template = self.preferences.get("message_template", "")
             if message_template:
@@ -1067,13 +1163,16 @@ class PayMeADrink:
                         bank_account=self.preferences.get("bank_account", ""),
                         qr_code_url=qr_html
                     )
-                    # Generate email as "first.surname" from the CSV key "Surname First [Middle]":
-                    # "Novák Jan" → "jan.novak@studentstc.cz" (middle names are ignored)
-                    name_parts = unidecode(person_key).lower().split()
-                    if len(name_parts) > 1:
-                        email = f"{name_parts[1]}.{name_parts[0]}@studentstc.cz"
-                    else:
-                        email = f"{name_parts[0]}@studentstc.cz"
+                    # Prefer the email from the CSV; otherwise build "first.surname" from the key
+                    # "Surname First [Middle]": "Novák Jan" → "jan.novak@studentstc.cz" (middle names ignored)
+                    email = next((p.get('email') for p in self.persons
+                                  if p['name'] == person_key and p.get('email')), "")
+                    if not email:
+                        name_parts = unidecode(person_key).lower().split()
+                        if len(name_parts) > 1:
+                            email = f"{name_parts[1]}.{name_parts[0]}@studentstc.cz"
+                        else:
+                            email = f"{name_parts[0]}@studentstc.cz"
 
                     messages.append({"email": email, "message": message})
 

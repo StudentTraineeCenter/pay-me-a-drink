@@ -9,3 +9,8 @@ PyPDF2
 pdf2image
 Pillow
 PyMuPDF
+numpy
+opencv-python-headless
+pytesseract
+# CPU-only build is enough: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
